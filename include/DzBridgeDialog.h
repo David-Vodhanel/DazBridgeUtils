@@ -2,6 +2,7 @@
 #include "dzbasicdialog.h"
 #include <QtGui/qcombobox.h>
 #include <QtCore/qsettings.h>
+#include <QtGui/qcheckbox.h>
 
 class QPushButton;
 class QLineEdit;
@@ -17,6 +18,8 @@ class UnitTest_DzBridgeDialog;
 
 namespace DzBridgeNameSpace
 {
+	class DzBridgeAction;
+
 	class CPP_Export DzBridgeDialog : public DzBasicDialog {
 		Q_OBJECT
 		Q_PROPERTY(QWidget* wAssetNameEdit READ getAssetNameEdit)
@@ -30,7 +33,10 @@ namespace DzBridgeNameSpace
 		Q_PROPERTY(QWidget* wExportMaterialPropertyCSVCheckBox READ getExportMaterialPropertyCSVCheckBox)
 		Q_PROPERTY(QWidget* wTargetPluginInstallerButton READ getTargetPluginInstallerButton)
 		Q_PROPERTY(QWidget* wTargetSoftwareVersionCombo READ getTargetSoftwareVersionCombo)
+        Q_PROPERTY(bool bEnableExperimentalOptions READ getEnableExperimentalOptions)
+		Q_PROPERTY(QWidget* wEnableLodCheckBox READ getEnableLodCheckBox)
 	public:
+		Q_INVOKABLE bool setBridgeActionObject(QObject* arg);
 		Q_INVOKABLE QLineEdit* getAssetNameEdit() { return assetNameEdit; }
 		Q_INVOKABLE QComboBox* getAssetTypeCombo() { return assetTypeCombo; }
 		Q_INVOKABLE QCheckBox* getMorphsEnabledCheckBox() { return morphsEnabledCheckBox; }
@@ -45,7 +51,12 @@ namespace DzBridgeNameSpace
 		Q_INVOKABLE QCheckBox* getExperimentalAnimationExportCheckBox() { return experimentalAnimationExportCheckBox; }
 		Q_INVOKABLE QCheckBox* getBakeAnimationExportCheckBox () { return  bakeAnimationExportCheckBox; }
 		Q_INVOKABLE QCheckBox* getFaceAnimationExportCheckBox() { return faceAnimationExportCheckBox; }
+		Q_INVOKABLE QSettings* getSettings() { return settings; }
 		Q_INVOKABLE QCheckBox* getAnimationExportActiveCurvesCheckBox() { return animationExportActiveCurvesCheckBox; }
+		Q_INVOKABLE QCheckBox* getAnimationApplyBoneScaleCheckBox() { return animationApplyBoneScaleCheckBox; }
+		Q_INVOKABLE QCheckBox* getMorphLockBoneTranslationCheckBox() { return morphLockBoneTranslationCheckBox; }
+        Q_INVOKABLE bool getEnableExperimentalOptions() { return m_enableExperimentalOptionsCheckBox->isChecked(); }
+		Q_INVOKABLE QCheckBox* getEnableLodCheckBox() { return m_wEnableLodCheckBox; }
 
 		/** Constructor **/
 		DzBridgeDialog(QWidget* parent = nullptr, const QString& windowTitle = "");
@@ -56,7 +67,8 @@ namespace DzBridgeNameSpace
 		// Pass so the DazToUnrealAction can access it from the morph dialog
 		Q_INVOKABLE QString GetMorphString();
 		// Pass so the DazToUnrealAction can access it from the morph dialog
-		Q_INVOKABLE QMap<QString, QString> GetMorphMapping() { return morphMapping; }
+		Q_INVOKABLE QMap<QString, QString> GetMorphMappingFromMorphSelectionDialog();
+		Q_INVOKABLE QList<QString> GetPoseList();
 		Q_INVOKABLE virtual void resetToDefaults();
 		Q_INVOKABLE virtual bool loadSavedSettings();
 		Q_INVOKABLE virtual void saveSettings();
@@ -67,12 +79,13 @@ namespace DzBridgeNameSpace
 		Q_INVOKABLE bool installEmbeddedArchive(QString sArchiveFilename, QString sDestinationPath);
 		Q_INVOKABLE virtual void setBridgeVersionStringAndLabel(QString sVersionString, QString sLabel="");
 		Q_INVOKABLE virtual void setDisabled(bool bDisable);
+		Q_INVOKABLE virtual void showLodRow(bool bShowWidget = true);
 
 		void accept();
 
 	protected slots:
 		virtual void handleSceneSelectionChanged();
-		virtual void HandleChooseMorphsButton();
+		virtual int  HandleChooseMorphsButton();
 		virtual void HandleMorphsCheckBoxChange(int state);
 		virtual void HandleChooseSubdivisionsButton();
 		virtual void HandleSubdivisionCheckBoxChange(int state);
@@ -84,43 +97,59 @@ namespace DzBridgeNameSpace
 		virtual void HandleTargetPluginInstallerButton();
 		virtual void HandleOpenIntermediateFolderButton(QString sFolderPath="");
 		virtual void HandleAssetTypeComboChange(const QString& assetType);
+		virtual void HandleAssetTypeComboChange(int state);
+        virtual void HandleExperimentalOptionsCheckBoxClicked();
+        virtual void HandleLodSettingsButton();
+		virtual void HandleEnableLodCheckBoxChange(int state);
 
 	protected:
-		QSettings* settings;
+		DzBridgeAction* m_BridgeAction = nullptr;
+		QSettings* settings = nullptr;
 
 		virtual void refreshAsset();
 
-		// These are clumsy leftovers from before the dialog were singletons
-		QString morphString;
-		QMap<QString, QString> morphMapping;
+		QFormLayout* mainLayout = nullptr;
+		QFormLayout* advancedLayout = nullptr;
+		QLineEdit* assetNameEdit = nullptr;
+		//	QLineEdit* projectEdit = nullptr;
+		//	QPushButton* projectButton = nullptr;
+		QComboBox* assetTypeCombo = nullptr;
+		QPushButton* morphsButton = nullptr;
+		QCheckBox* morphsEnabledCheckBox = nullptr;
+		QPushButton* subdivisionButton = nullptr;
+		QCheckBox* subdivisionEnabledCheckBox = nullptr;
+        QLabel* m_WelcomeLabel = nullptr;
 
-		QFormLayout* mainLayout;
-		QFormLayout* advancedLayout;
-		QLineEdit* assetNameEdit;
-		//	QLineEdit* projectEdit;
-		//	QPushButton* projectButton;
-		QComboBox* assetTypeCombo;
-		QPushButton* morphsButton;
-		QCheckBox* morphsEnabledCheckBox;
-		QPushButton* subdivisionButton;
-		QCheckBox* subdivisionEnabledCheckBox;
-		QGroupBox* advancedSettingsGroupBox;
-		QWidget* advancedWidget;
-		QComboBox* fbxVersionCombo;
-		QCheckBox* showFbxDialogCheckBox;
-		QCheckBox* enableNormalMapGenerationCheckBox;
-		QCheckBox* exportMaterialPropertyCSVCheckBox;
-		QWidget* m_wTargetPluginInstaller;
-		QPushButton* m_TargetPluginInstallerButton;
-		QComboBox* m_TargetSoftwareVersionCombo;
-		QLabel* m_BridgeVersionLabel;
-		QLabel* m_WelcomeLabel;
-		QPushButton* m_OpenIntermediateFolderButton;
-		QGroupBox* animationSettingsGroupBox;
-		QCheckBox* experimentalAnimationExportCheckBox;
-		QCheckBox* bakeAnimationExportCheckBox;
-		QCheckBox* faceAnimationExportCheckBox;
-		QCheckBox* animationExportActiveCurvesCheckBox;
+        // Advanced settings
+		QGroupBox* advancedSettingsGroupBox = nullptr;
+		QWidget* advancedWidget = nullptr;
+		QComboBox* fbxVersionCombo = nullptr;
+		QCheckBox* showFbxDialogCheckBox = nullptr;
+		QCheckBox* enableNormalMapGenerationCheckBox = nullptr;
+		QCheckBox* exportMaterialPropertyCSVCheckBox = nullptr;
+		QWidget* m_wTargetPluginInstaller = nullptr;
+		QPushButton* m_TargetPluginInstallerButton = nullptr;
+		QComboBox* m_TargetSoftwareVersionCombo = nullptr;
+		QLabel* m_BridgeVersionLabel = nullptr;
+		QPushButton* m_OpenIntermediateFolderButton = nullptr;
+        QCheckBox* m_enableExperimentalOptionsCheckBox = nullptr;
+
+		// Animation settings
+		QGroupBox* animationSettingsGroupBox = nullptr;
+		QCheckBox* experimentalAnimationExportCheckBox = nullptr;
+		QCheckBox* bakeAnimationExportCheckBox = nullptr;
+		QCheckBox* faceAnimationExportCheckBox = nullptr;
+		QCheckBox* animationExportActiveCurvesCheckBox = nullptr;
+		QCheckBox* animationApplyBoneScaleCheckBox = nullptr;
+
+		// Morph settings
+		QGroupBox* morphSettingsGroupBox = nullptr;
+		QCheckBox* morphLockBoneTranslationCheckBox = nullptr;
+
+		// LOD settings
+		QPushButton* m_wLodSettingsButton = nullptr;
+		QCheckBox* m_wEnableLodCheckBox = nullptr;
+		QWidget* m_wLodRowLabelWidget = nullptr;
 
 		QString m_sEmbeddedFilesPath = ":/DazBridge";
 		bool m_bDontSaveSettings = false;

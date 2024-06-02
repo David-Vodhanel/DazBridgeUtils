@@ -58,6 +58,8 @@ namespace DzBridgeNameSpace
 		QString Morph;
 		double Scalar;
 		double Alpha;
+		bool IsBaseJCM = false;
+		MorphInfo LinkMorphInfo;
 		QList<JointLinkKey> Keys;
 	};
 
@@ -72,33 +74,26 @@ namespace DzBridgeNameSpace
 		Q_INVOKABLE void PrepareDialog();
 
 		// Singleton access
-		Q_INVOKABLE static DzBridgeMorphSelectionDialog* Get(QWidget* Parent)
-		{
-			if (singleton == nullptr)
-			{
-				singleton = new DzBridgeMorphSelectionDialog(Parent);
-			}
-			else
-			{
-				singleton->PrepareDialog();
-			}
-			return singleton;
-		}
+		Q_INVOKABLE static DzBridgeMorphSelectionDialog* Get(QWidget* Parent);
 
-		// Get the morph string (aka morphsToExport) in the format for the Daz FBX Export
+		// Get the morph string (aka m_morphsToExport) in the format for the Daz FBX Export
 		Q_INVOKABLE QString GetMorphString();
 
-		// Get the morph string (aka morphsToExport) in the format used for presets
-		Q_INVOKABLE QString GetMorphCSVString();
+		// Get the morph string (aka m_morphsToExport) in the format used for presets
+		Q_INVOKABLE QString GetMorphCSVString(bool bUseFinalizedList = true);
 
-		// Get the morph string (aka morphsToExport) in an internal name = friendly name format
+		// Get the morph string (aka m_morphsToExport) in an internal name = friendly name format
 		// Used to rename them to the friendly name in Unreal
-		Q_INVOKABLE QMap<QString, QString> GetMorphRenaming();
+		Q_INVOKABLE QMap<QString, QString> GetMorphMapping();
 
 		Q_INVOKABLE bool IsAutoJCMEnabled() { return autoJCMCheckBox->isChecked(); }
+		Q_INVOKABLE bool IsFakeDualQuatEnabled() { return fakeDualQuatCheckBox->isChecked(); }
+		Q_INVOKABLE bool IsAllowMorphDoubleDippingEnabled() { return allowMorphDoubleDippingCheckBox->isChecked(); }
 
 		// Recursive function for finding all active JCM morphs for a node
 		Q_INVOKABLE QList<JointLinkInfo> GetActiveJointControlledMorphs(DzNode* Node = nullptr);
+		// Find and ADD JCMs
+		Q_INVOKABLE void AddActiveJointControlledMorphs(DzNode* Node = nullptr);
 
 		// Retrieve label based on morph name
 		// DB Dec-21-2021, Created for scripting.
@@ -108,10 +103,17 @@ namespace DzBridgeNameSpace
 		// DB June-01-2022, Created for MorphLinks Generation for Blender Bridge Morphs Support
 		Q_INVOKABLE MorphInfo GetMorphInfoFromName(QString morphName);
 		Q_INVOKABLE void SetAutoJCMVisible(bool bVisible);
+		Q_INVOKABLE void SetAutoJCMEnabled(bool bEnabled);
+		// DB 2023-July-10
+		Q_INVOKABLE void SetAllowMorphDoubleDippingVisible(bool bVisible);
+		Q_INVOKABLE void SetAllowMorphDoubleDippingEnabled(bool bEnabled);
 
 		// get morph property name
 		Q_INVOKABLE static QString getMorphPropertyName(DzProperty* pMorphProperty);
 		Q_INVOKABLE QList<QString> getMorphNamesToDisconnectList();
+
+		// Get Pose list.  Similart to morphs, but without AutoJCM or FakeDualQuat items
+		Q_INVOKABLE QList<QString> GetPoseList();
 
 	public slots:
 		void FilterChanged(const QString& filter);
@@ -126,7 +128,13 @@ namespace DzBridgeNameSpace
 		void HandleARKitGenesis81MorphsButton();
 		void HandleFaceFXGenesis8Button();
 		void HandleAutoJCMCheckBoxChange(bool checked);
+		void HandleFakeDualQuatCheckBoxChange(bool checked);
 		void HandleAddConnectedMorphs();
+		void HandleDialogAccepted(bool bSavePreset = true);
+
+	protected:
+		virtual void addGenesis9FACS(QStringList& MorphsToAdd); // similar to ARKit G81 method, but adds a set of FACS specifically for WonderStudio
+		virtual void addGenesis81FACS(QStringList& MorphsToAdd); // similar to ARKit G81 method, but adds a set of FACS specifically for WonderStudio
 
 	private:
 		// check if Morph is Valid
@@ -160,22 +168,16 @@ namespace DzBridgeNameSpace
 		QList<MorphInfo> selectedInTree;
 
 		// List of morphs moved to the export box
-		QList<MorphInfo> morphsToExport;
+		QList<MorphInfo> m_morphsToExport;
+		QList<MorphInfo> m_morphsToExport_finalized;
 
 		// Store off the presetsFolder path at dialog setup
 		QString presetsFolder;
 
 		static DzBridgeMorphSelectionDialog* singleton;
 
-		// A list of all found morphs.
-		QStringList morphList;
-
-		// Mapping of morph name to label
-		QMap<QString, QString> morphNameMapping;
-
 		// Mapping of morph name to MorphInfo
-		//TODO: morphNameMapping (and others) should be replaced by this
-		QMap<QString, MorphInfo> morphs;
+		QMap<QString, MorphInfo> m_morphInfoMap;
 
 		// List of morphs (recursive) under each tree node
 		// For convenience populating the middle box.
@@ -194,6 +196,10 @@ namespace DzBridgeNameSpace
 		QTreeWidgetItem* fullBodyMorphTreeItem;
 		QTreeWidgetItem* charactersTreeItem;
 		QCheckBox* autoJCMCheckBox;
+		QCheckBox* fakeDualQuatCheckBox;
+		QPushButton* addConnectedMorphsButton;
+
+		QCheckBox* allowMorphDoubleDippingCheckBox;
 
 		QSettings* settings;
 	};

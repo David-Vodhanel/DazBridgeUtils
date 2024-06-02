@@ -94,6 +94,27 @@ bool OpenFBXInterface::SaveScene(FbxScene* pScene, QString sFilename, int nFileF
 	// Create FbxExporter
 	FbxExporter* pExporter = FbxExporter::Create(m_fbxManager, "");
 
+	///////////////////////////////////
+	// DEBUG
+	///////////////////////////////////
+	bool bUseAscii = false;
+	if (bUseAscii)
+	{
+		int lFormatIndex, lFormatCount = m_fbxManager->GetIOPluginRegistry()->GetWriterFormatCount();
+		for (lFormatIndex = 0; lFormatIndex < lFormatCount; lFormatIndex++)
+		{
+			if (m_fbxManager->GetIOPluginRegistry()->WriterIsFBX(lFormatIndex))
+			{
+				FbxString lDesc = m_fbxManager->GetIOPluginRegistry()->GetWriterFormatDescription(lFormatIndex);
+				if (lDesc.Find("ascii") >= 0)
+				{
+					nFileFormat = lFormatIndex;
+					break;
+				}
+			}
+		}
+	}
+
 	// Check if fileformat is invalid
 	if (nFileFormat < 0 || nFileFormat >= m_fbxManager->GetIOPluginRegistry()->GetWriterFormatCount())
 	{
@@ -164,12 +185,35 @@ bool OpenFBXInterface::LoadScene(FbxScene* pScene, QString sFilename)
 
 }
 
-
 FbxScene* OpenFBXInterface::CreateScene(QString sSceneName)
 {
 	FbxScene* pNewScene = FbxScene::Create(m_fbxManager, sSceneName.toLocal8Bit().data());
 
 	return pNewScene;
+}
+
+FbxGeometry* OpenFBXInterface::FindGeometry(FbxScene* pScene, QString sGeometryName)
+{
+	int numGeometry = pScene->GetGeometryCount();
+	for (int i = 0; i < numGeometry; i++)
+	{
+		FbxGeometry* geo = pScene->GetGeometry(i);
+		FbxNode* node = geo->GetNode();
+		auto raw_name = node->GetName();
+		QString sGeoName(raw_name);
+		if (sGeoName == sGeometryName)
+		{
+			return geo;
+		}
+	}
+	return nullptr;
+}
+
+FbxNode* OpenFBXInterface::FindNode(FbxScene* pScene, QString sNodeName)
+{
+	FbxString fsName(sNodeName.toLocal8Bit().data());
+	auto result = pScene->FindNodeByName(fsName);
+	return result;
 }
 
 #include "moc_OpenFBXInterface.cpp"

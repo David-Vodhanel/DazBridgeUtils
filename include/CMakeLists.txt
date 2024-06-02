@@ -10,9 +10,11 @@ set(LIB_HEADERS
 	${CMAKE_CURRENT_SOURCE_DIR}/DzBridgeAction.h
 	${CMAKE_CURRENT_SOURCE_DIR}/DzBridgeMorphSelectionDialog.h
 	${CMAKE_CURRENT_SOURCE_DIR}/DzBridgeSubdivisionDialog.h
+	${CMAKE_CURRENT_SOURCE_DIR}/DzBridgeLodSettingsDialog.h
 	${CMAKE_CURRENT_SOURCE_DIR}/DzBridgeDialog.h
 	${CMAKE_CURRENT_SOURCE_DIR}/common_version.h
 	${CMAKE_CURRENT_SOURCE_DIR}/UnitTest.h
 	${CMAKE_CURRENT_SOURCE_DIR}/zip.h
+	${CMAKE_CURRENT_SOURCE_DIR}/ImageTools.h
 )
 set(LIB_HEADERS ${LIB_HEADERS} PARENT_SCOPE)

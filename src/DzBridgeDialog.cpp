@@ -29,6 +29,7 @@
 #include "DzBridgeDialog.h"
 #include "DzBridgeMorphSelectionDialog.h"
 #include "DzBridgeSubdivisionDialog.h"
+#include "DzBridgeLodSettingsDialog.h"
 #include "common_version.h"
 
 #include "zip.h"
@@ -40,6 +41,16 @@ Local definitions
 
 using namespace DzBridgeNameSpace;
 
+bool DzBridgeDialog::setBridgeActionObject(QObject* arg) {
+	DzBridgeAction* action = qobject_cast<DzBridgeAction*>(arg);
+	if (action)
+	{
+		m_BridgeAction = (DzBridgeAction*)arg;
+		return true;
+	}
+	return false;
+}
+
 DzBridgeDialog::DzBridgeDialog(QWidget *parent, const QString &windowTitle) :
 	DzBasicDialog(parent, DAZ_BRIDGE_LIBRARY_NAME)
 {
@@ -47,6 +58,10 @@ DzBridgeDialog::DzBridgeDialog(QWidget *parent, const QString &windowTitle) :
 	{
 		m_bSetupMode = true;
 	}
+
+#ifdef VODSVERSION
+	m_bSetupMode = false;
+#endif
 
 	 assetNameEdit = nullptr;
 //	 projectEdit = nullptr;
@@ -60,6 +75,8 @@ DzBridgeDialog::DzBridgeDialog(QWidget *parent, const QString &windowTitle) :
 	 fbxVersionCombo = nullptr;
 	 showFbxDialogCheckBox = nullptr;
 	 animationSettingsGroupBox = nullptr;
+	 m_wLodSettingsButton = nullptr;
+	 m_wEnableLodCheckBox = nullptr;
 
 	 settings = nullptr;
 	 m_wTargetPluginInstaller = nullptr;
@@ -73,9 +90,9 @@ DzBridgeDialog::DzBridgeDialog(QWidget *parent, const QString &windowTitle) :
 	int revision = COMMON_REV % 1000;
 	QString workingTitle;
 	if (windowTitle != "")
-		workingTitle = windowTitle + QString(tr(" v%1.%2 Build %3.%4")).arg(COMMON_MAJOR).arg(COMMON_MINOR).arg(revision).arg(COMMON_BUILD);
+		workingTitle = windowTitle + QString(tr(" %1 v%2.%3.%4")).arg(COMMON_MAJOR).arg(COMMON_MINOR).arg(revision).arg(COMMON_BUILD);
 	else
-		workingTitle = QString(tr("DazBridge v%1.%2 Build %3.%4").arg(COMMON_MAJOR).arg(COMMON_MINOR).arg(revision).arg(COMMON_BUILD));
+		workingTitle = QString(tr("DazBridge %1 v%2.%3.%4").arg(COMMON_MAJOR).arg(COMMON_MINOR).arg(revision).arg(COMMON_BUILD));
 	setWindowTitle(workingTitle);
 	layout()->setSizeConstraint(QLayout::SetFixedSize);
 	mainLayout = new QFormLayout();
@@ -92,8 +109,11 @@ To find out more about Daz Bridges, go to <a href=\"https://www.daz3d.com/daz-br
 	m_WelcomeLabel->setWordWrap(true);
 	m_WelcomeLabel->setText(sSetupModeString);
 	m_WelcomeLabel->setOpenExternalLinks(true);
-//	m_WelcomeLabel->setHidden(true);
+#ifdef VODSVERSION
+	m_WelcomeLabel->setHidden(true);
+#else
 	mainLayout->addRow(m_WelcomeLabel);
+#endif
 
 	advancedWidget = new QWidget();
 	QHBoxLayout* advancedLayoutOuter = new QHBoxLayout();
@@ -112,21 +132,54 @@ To find out more about Daz Bridges, go to <a href=\"https://www.daz3d.com/daz-br
 	assetTypeCombo->addItem("Animation");
 	assetTypeCombo->addItem("Environment");
 	assetTypeCombo->addItem("Pose");
+	//assetTypeCombo->addItem("MLDeformer");
 	connect(assetTypeCombo, SIGNAL(currentIndexChanged(const QString&)), this, SLOT(HandleAssetTypeComboChange(const QString&)));
+	// Connect new asset type handler
+	connect(assetTypeCombo, SIGNAL(activated(int)), this, SLOT(HandleAssetTypeComboChange(int)));
 
 	// Animation Settings
-	animationSettingsGroupBox = new QGroupBox("Animation Settings", this);
+#ifdef VODSVERSION
+    animationSettingsGroupBox = new QGroupBox("Animation Settings", this);
+#else
+    animationSettingsGroupBox = new QGroupBox("Experimental Animation Settings", this);
+#endif
 	QFormLayout* animationSettingsLayout = new QFormLayout();
 	animationSettingsGroupBox->setLayout(animationSettingsLayout);
 	experimentalAnimationExportCheckBox = new QCheckBox("", animationSettingsGroupBox);
-	animationSettingsLayout->addRow("Use Experimental Export", experimentalAnimationExportCheckBox);
+	experimentalAnimationExportCheckBox->setChecked(true);
+	animationSettingsLayout->addRow("Use New Export", experimentalAnimationExportCheckBox);
+
+    // DB 2023-Aug-09: bake animation does not appear to be hooked up to anything, disabling for now
 	bakeAnimationExportCheckBox = new QCheckBox("", animationSettingsGroupBox);
-	animationSettingsLayout->addRow("Bake", bakeAnimationExportCheckBox);
+//	animationSettingsLayout->addRow("Bake", bakeAnimationExportCheckBox);
+    bakeAnimationExportCheckBox->setVisible(false);
+    bakeAnimationExportCheckBox->setDisabled(true);
+
 	faceAnimationExportCheckBox = new QCheckBox("", animationSettingsGroupBox);
 	animationSettingsLayout->addRow("Transfer Face Bones", faceAnimationExportCheckBox);
 	animationExportActiveCurvesCheckBox = new QCheckBox("", animationSettingsGroupBox);
 	animationSettingsLayout->addRow("Transfer Active Curves", animationExportActiveCurvesCheckBox);
+	animationApplyBoneScaleCheckBox = new QCheckBox("", animationSettingsGroupBox);
+	animationSettingsLayout->addRow("Apply Bone Scale", animationApplyBoneScaleCheckBox);
 	animationSettingsGroupBox->setVisible(false);
+                                  
+    // Animation Help Text
+    const char* AnimationExportHelpText = "New custom animation export pathway which can produce\n\
+better quality.  **DOES NOT EXPORT MESH**";
+    experimentalAnimationExportCheckBox->setWhatsThis(tr(AnimationExportHelpText));
+    experimentalAnimationExportCheckBox->setToolTip(tr(AnimationExportHelpText));
+    const char* BakeAnimationHelpText ="Bake complex animations to their base componenents.";
+    bakeAnimationExportCheckBox->setWhatsThis(tr(BakeAnimationHelpText));
+    bakeAnimationExportCheckBox->setToolTip(tr(BakeAnimationHelpText));
+	const char* FaceAnimationHelpText = "Export animated face bones.";
+    faceAnimationExportCheckBox->setWhatsThis(tr(FaceAnimationHelpText));
+	faceAnimationExportCheckBox->setToolTip(tr(FaceAnimationHelpText));
+	const char* ActiveCurvesHelpText = "Export animated properties.";
+    animationExportActiveCurvesCheckBox->setWhatsThis(tr(ActiveCurvesHelpText));
+	animationExportActiveCurvesCheckBox->setToolTip(tr(ActiveCurvesHelpText));
+	const char* ApplyBoneScaleHelpText = "Apply bone scale values to animations.";
+    animationApplyBoneScaleCheckBox->setWhatsThis(tr(ApplyBoneScaleHelpText));
+	animationApplyBoneScaleCheckBox->setToolTip(tr(ApplyBoneScaleHelpText));
 
 	// Morphs
 	QHBoxLayout* morphsLayout = new QHBoxLayout();
@@ -138,6 +191,15 @@ To find out more about Daz Bridges, go to <a href=\"https://www.daz3d.com/daz-br
 	morphsLayout->addWidget(morphsButton);
 	connect(morphsEnabledCheckBox, SIGNAL(stateChanged(int)), this, SLOT(HandleMorphsCheckBoxChange(int)));
 
+	// Morph Settings
+	morphSettingsGroupBox = new QGroupBox("Morph Settings", this);
+	QFormLayout* morphSettingsLayout = new QFormLayout();
+	morphSettingsGroupBox->setLayout(morphSettingsLayout);
+	morphLockBoneTranslationCheckBox = new QCheckBox("", morphSettingsGroupBox);
+	morphLockBoneTranslationCheckBox->setChecked(false);
+	morphSettingsLayout->addRow("Lock Bone Translation for Morphs", morphLockBoneTranslationCheckBox);
+	morphSettingsGroupBox->setVisible(false);
+
 	// Subdivision
 	QHBoxLayout* subdivisionLayout = new QHBoxLayout();
 	subdivisionButton = new QPushButton(tr("Bake Subdivision Levels"), this);
@@ -147,6 +209,19 @@ To find out more about Daz Bridges, go to <a href=\"https://www.daz3d.com/daz-br
 	subdivisionLayout->addWidget(subdivisionEnabledCheckBox);
 	subdivisionLayout->addWidget(subdivisionButton);
 	connect(subdivisionEnabledCheckBox, SIGNAL(stateChanged(int)), this, SLOT(HandleSubdivisionCheckBoxChange(int)));
+
+	// LOD Settings
+	QHBoxLayout* lodSettingsLayout = new QHBoxLayout();
+	lodSettingsLayout->setContentsMargins(0,0,0,0);
+	m_wLodSettingsButton = new QPushButton(tr("Configure LOD Settings"), this);
+	connect(m_wLodSettingsButton, SIGNAL(released()), this, SLOT(HandleLodSettingsButton()));
+	m_wEnableLodCheckBox = new QCheckBox("", this);
+	m_wEnableLodCheckBox->setMaximumWidth(25);
+	lodSettingsLayout->addWidget(m_wEnableLodCheckBox);
+	lodSettingsLayout->addWidget(m_wLodSettingsButton);
+	connect(m_wEnableLodCheckBox, SIGNAL(stateChanged(int)), this, SLOT(HandleEnableLodCheckBoxChange(int)));
+
+	/////////////////// Advanced Settings Section /////////////////////
 
 	// FBX Version
 	fbxVersionCombo = new QComboBox(this);
@@ -177,6 +252,7 @@ To find out more about Daz Bridges, go to <a href=\"https://www.daz3d.com/daz-br
 	connect(exportMaterialPropertyCSVCheckBox, SIGNAL(stateChanged(int)), this, SLOT(HandleExportMaterialPropertyCSVCheckBoxChange(int)));
 
 	// Install Destination Software Bridge
+#ifndef VODSVERSION
 	m_wTargetPluginInstaller = new QWidget();
 	QHBoxLayout* targetPluginInstallerLayout = new QHBoxLayout();
 	m_TargetSoftwareVersionCombo = new QComboBox(m_wTargetPluginInstaller);
@@ -186,36 +262,53 @@ To find out more about Daz Bridges, go to <a href=\"https://www.daz3d.com/daz-br
 	targetPluginInstallerLayout->addWidget(m_TargetSoftwareVersionCombo, 2);
 	targetPluginInstallerLayout->addWidget(m_TargetPluginInstallerButton, 1);
 	m_wTargetPluginInstaller->setLayout(targetPluginInstallerLayout);
+#endif
 
 	// Bridge Software Version Label
-	QString sBridgeVersionString = QString(tr("Daz Bridge Library v%1.%2  revision %3.%4")).arg(COMMON_MAJOR).arg(COMMON_MINOR).arg(revision).arg(COMMON_BUILD);
+	QString sBridgeVersionString = QString(tr("Daz Bridge Library %1 v%2.%3.%4")).arg(COMMON_MAJOR).arg(COMMON_MINOR).arg(revision).arg(COMMON_BUILD);
 	m_BridgeVersionLabel = new QLabel(sBridgeVersionString);
 
 	// Go To Intermediate Folder
 	m_OpenIntermediateFolderButton = new QPushButton(tr("Open Intermediate Folder"));
 	connect(m_OpenIntermediateFolderButton, SIGNAL(clicked(bool)), this, SLOT(HandleOpenIntermediateFolderButton()));
 
+    // Use this->getEnableExperimentalOptions() to query state, see HandleAssetTypeComboChange() for example
+    // Enable Experimental Settings
+    m_enableExperimentalOptionsCheckBox = new QCheckBox("", this);
+	connect(m_enableExperimentalOptionsCheckBox, SIGNAL(clicked(bool)), this, SLOT(HandleExperimentalOptionsCheckBoxClicked()));
+                                  
 	// Add the widget to the basic dialog
 	mainLayout->addRow("Asset Name", assetNameEdit);
 	mainLayout->addRow("Asset Type", assetTypeCombo);
 	mainLayout->addRow("Export Morphs", morphsLayout);
 	mainLayout->addRow("Bake Subdivision", subdivisionLayout);
 
+	// Create LOD Row, then store lod row widget, then hide row as default state
+	mainLayout->addRow("Enable LOD", lodSettingsLayout);
+	m_wLodRowLabelWidget = mainLayout->itemAt(mainLayout->rowCount()-1, QFormLayout::LabelRole)->widget();
+	this->showLodRow(false);
+
 	// Advanced Settings Layout
 	advancedLayout->addRow("", m_BridgeVersionLabel);
+#ifndef VODSVERSION
 	advancedLayout->addRow("Install Destination Plugin", m_wTargetPluginInstaller);
+#endif
 	advancedLayout->addRow("", m_OpenIntermediateFolderButton);
 	showTargetPluginInstaller(false);
 	advancedLayout->addRow("FBX Version", fbxVersionCombo);
 	advancedLayout->addRow("Show FBX Dialog", showFbxDialogCheckBox);
 	advancedLayout->addRow("Generate Normal Maps", enableNormalMapGenerationCheckBox);
 	advancedLayout->addRow("Export Material CSV", exportMaterialPropertyCSVCheckBox);
+    advancedLayout->addRow("Enable Experimental Options", m_enableExperimentalOptionsCheckBox);
 
 	addLayout(mainLayout);
 
-	// Add Animation settings
-	addWidget(animationSettingsGroupBox);
+	// Add Animation settings to the main layout as a new row without header
+	mainLayout->addRow(animationSettingsGroupBox);
 
+	// Add Morph settings to the main layout as a new row without header
+	mainLayout->addRow(morphSettingsGroupBox);
+	
 	// Advanced
 	advancedSettingsGroupBox = new QGroupBox("Advanced Settings", this);
 	advancedSettingsGroupBox->setLayout(advancedLayoutOuter);
@@ -235,7 +328,16 @@ To find out more about Daz Bridges, go to <a href=\"https://www.daz3d.com/daz-br
 	showFbxDialogCheckBox->setWhatsThis("Checking this will show the FBX Dialog for adjustments before export.");
 	exportMaterialPropertyCSVCheckBox->setWhatsThis("Checking this will write out a CSV of all the material properties.  Useful for reference when changing materials.");
 	enableNormalMapGenerationCheckBox->setWhatsThis("Checking this will enable generation of Normal Maps for any surfaces that only have Bump Height Maps.");
-	m_wTargetPluginInstaller->setWhatsThis("Install a plugin to use Daz Bridge with the destination software.");
+	//m_wTargetPluginInstaller->setWhatsThis("Install a plugin to use Daz Bridge with the destination software.");
+	QString sEnableLodHelp = tr("Enable Level of Detail (LOD) mesh.  Specific features depend on the destination software.");
+	m_wLodRowLabelWidget->setWhatsThis(sEnableLodHelp);
+	m_wLodRowLabelWidget->setToolTip(sEnableLodHelp);
+	m_wEnableLodCheckBox->setWhatsThis(sEnableLodHelp);
+	m_wEnableLodCheckBox->setToolTip(sEnableLodHelp);
+	QString sLodSettingsHelp = tr("Configure how Level of Detail (LOD) meshes are set up or generated in the destination software.");
+	m_wLodSettingsButton->setWhatsThis(sLodSettingsHelp);
+	m_wLodSettingsButton->setToolTip(sLodSettingsHelp);
+
 
 	// detect scene change
 	connect(dzScene, SIGNAL(nodeSelectionListChanged()), this, SLOT(handleSceneSelectionChanged()));
@@ -247,8 +349,10 @@ To find out more about Daz Bridges, go to <a href=\"https://www.daz3d.com/daz-br
 	{
 		setDisabled(true);
 	}
-	m_WelcomeLabel->setVisible(true);
 
+#ifndef VODSVERSION
+	m_WelcomeLabel->setVisible(true);
+#endif
 }
 
 void DzBridgeDialog::renameTargetPluginInstaller(QString sNewLabelName)
@@ -307,15 +411,20 @@ bool DzBridgeDialog::loadSavedSettings()
 	{
 		showFbxDialogCheckBox->setChecked(settings->value("ShowFBXDialog").toBool());
 	}
-	if (!m_bSetupMode && !settings->value("ShowAdvancedSettings").isNull())
+	if (m_bSetupMode)
+	{
+		advancedSettingsGroupBox->setChecked(true);
+		advancedWidget->setHidden(false);
+	}
+	else if (!settings->value("ShowAdvancedSettings").isNull())
 	{
 		advancedSettingsGroupBox->setChecked(settings->value("ShowAdvancedSettings").toBool());
 		advancedWidget->setHidden(!advancedSettingsGroupBox->isChecked());
 	}
 	else
 	{
-		advancedSettingsGroupBox->setChecked(true);
-		advancedWidget->setHidden(false);
+		advancedSettingsGroupBox->setChecked(false);
+		advancedWidget->setHidden(true);
 	}
 	if (!settings->value("FBXExportVersion").isNull())
 	{
@@ -351,6 +460,14 @@ bool DzBridgeDialog::loadSavedSettings()
 	{
 		animationExportActiveCurvesCheckBox->setChecked(settings->value("AnimationExportActiveCurves").toBool());
 	}
+	if (!settings->value("AnimationApplyBoneScale").isNull())
+	{
+		animationApplyBoneScaleCheckBox->setChecked(settings->value("AnimationApplyBoneScale").toBool());
+	}
+	//if (!settings->value("MLDeformerPoseCount").isNull())
+	//{
+	//	mlDeformerPoseCountEdit->setText(settings->value("MLDeformerPoseCount").toString());
+	//}
 
 	return true;
 }
@@ -358,10 +475,14 @@ bool DzBridgeDialog::loadSavedSettings()
 // Some settings will be saved when Accept is hit so we don't need a hanlder attached to all of them
 void DzBridgeDialog::saveSettings()
 {
+	if (settings == nullptr || m_bDontSaveSettings) return;
+	if (experimentalAnimationExportCheckBox == nullptr) return;
 	settings->setValue("AnimationExperminentalExport", experimentalAnimationExportCheckBox->isChecked());
 	settings->setValue("AnimationBake", bakeAnimationExportCheckBox->isChecked());
 	settings->setValue("AnimationExportFace", faceAnimationExportCheckBox->isChecked());
 	settings->setValue("AnimationExportActiveCurves", animationExportActiveCurvesCheckBox->isChecked());
+	settings->setValue("AnimationApplyBoneScale", animationApplyBoneScaleCheckBox->isChecked());
+	//settings->setValue("MLDeformerPoseCount", mlDeformerPoseCountEdit->text().toInt());
 }
 
 void DzBridgeDialog::refreshAsset()
@@ -413,6 +534,9 @@ void DzBridgeDialog::resetToDefaults()
 
 void DzBridgeDialog::handleSceneSelectionChanged()
 {
+	// crashfix
+	if (dzApp->isClosing()) return;
+
 	refreshAsset();
 
 	if (dzScene->getPrimarySelection() == nullptr)
@@ -426,30 +550,45 @@ void DzBridgeDialog::handleSceneSelectionChanged()
 		setDisabled(false);
 	}
 
+	// DB (2022-Sept-26): Crashfix for changing selection and exporting without opening morphselectiondialog
+	DzBridgeMorphSelectionDialog* morphDialog = DzBridgeMorphSelectionDialog::Get(this);
+	morphDialog->PrepareDialog();
+
 }
 
-void DzBridgeDialog::HandleChooseMorphsButton()
+int DzBridgeDialog::HandleChooseMorphsButton()
 {
-	DzBridgeMorphSelectionDialog *dlg = DzBridgeMorphSelectionDialog::Get(this);
-	dlg->exec();
-	morphString = dlg->GetMorphString();
-	morphMapping = dlg->GetMorphRenaming();
+	DzBridgeMorphSelectionDialog * morphDialog = DzBridgeMorphSelectionDialog::Get(this);
+	int dialogReturnCode = morphDialog->exec();
+	return dialogReturnCode;
 }
 
 void DzBridgeDialog::HandleChooseSubdivisionsButton()
 {
-	DzBridgeSubdivisionDialog *dlg = DzBridgeSubdivisionDialog::Get(this);
-	dlg->exec();
+	DzBridgeSubdivisionDialog *subdivisionDialog = DzBridgeSubdivisionDialog::Get(this);
+	subdivisionDialog->exec();
 }
 
 QString DzBridgeDialog::GetMorphString()
 {
-	morphMapping = DzBridgeMorphSelectionDialog::Get(this)->GetMorphRenaming();
-	return DzBridgeMorphSelectionDialog::Get(this)->GetMorphString();
+	DzBridgeMorphSelectionDialog* morphDialog = DzBridgeMorphSelectionDialog::Get(this);
+	return morphDialog->GetMorphString();
+}
+
+QMap<QString, QString> DzBridgeDialog::GetMorphMappingFromMorphSelectionDialog()
+{
+	DzBridgeMorphSelectionDialog* morphDialog = DzBridgeMorphSelectionDialog::Get(this);
+	return morphDialog->GetMorphMapping();
+}
+
+QList<QString> DzBridgeDialog::GetPoseList()
+{
+	return DzBridgeMorphSelectionDialog::Get(this)->GetPoseList();
 }
 
 void DzBridgeDialog::HandleMorphsCheckBoxChange(int state)
 {
+	morphSettingsGroupBox->setHidden(state != Qt::Checked);
 	if (settings == nullptr || m_bDontSaveSettings) return;
 	settings->setValue("MorphsEnabled", state == Qt::Checked);
 }
@@ -662,6 +801,7 @@ void DzBridgeDialog::setDisabled(bool bDisabled)
 	assetTypeCombo->setDisabled(bDisabled);
 	subdivisionButton->setDisabled(bDisabled);
 	morphsButton->setDisabled(bDisabled);
+	m_wLodSettingsButton->setDisabled(bDisabled);
 
 }
 
@@ -703,7 +843,114 @@ void DzBridgeDialog::HandleOpenIntermediateFolderButton(QString sFolderPath)
 
 void DzBridgeDialog::HandleAssetTypeComboChange(const QString& assetType)
 {
-	animationSettingsGroupBox->setVisible(assetType == "Animation");
+#ifdef VODSVERSION
+	animationSettingsGroupBox->setVisible(assetType == "Animation" || assetType == "Pose");
+    //mlDeformerSettingsGroupBox->setVisible(assetType == "MLDeformer");
+#else
+    if (this->getEnableExperimentalOptions()) {
+		animationSettingsGroupBox->setVisible(assetType == "Animation" || assetType == "Pose");
+	}
+	else {
+		animationSettingsGroupBox->setVisible(false);
+        experimentalAnimationExportCheckBox->setChecked(false);
+        bakeAnimationExportCheckBox->setChecked(false);
+        faceAnimationExportCheckBox->setChecked(false);
+        animationExportActiveCurvesCheckBox->setChecked(false);
+        animationApplyBoneScaleCheckBox->setChecked(false);
+    }
+#endif
+}
+
+void DzBridgeDialog::HandleAssetTypeComboChange(int state)
+{
+	QString assetNameString = assetNameEdit->text();
+
+	// TODO: replace string compare with itemData system
+	QString sAssetType = assetTypeCombo->currentText();
+
+	/// Enable morphs if:
+	/// skeletal mesh, static mesh, animation
+	if (sAssetType == "Skeletal Mesh" ||
+		sAssetType == "Static Mesh" ||
+		sAssetType == "Animation" ||
+		sAssetType == "Pose" )
+	{
+		morphsEnabledCheckBox->setDisabled(false);
+		morphsButton->setDisabled(false);
+	}
+	else
+	{
+		morphsEnabledCheckBox->setChecked(false);
+		morphsEnabledCheckBox->setDisabled(true);
+		morphsButton->setDisabled(true);
+	}
+
+	/// Enable subdivision and lod only if:
+	/// skeletal mesh, static mesh
+	if (sAssetType == "Skeletal Mesh" ||
+		sAssetType == "Static Mesh" )
+	{
+		subdivisionEnabledCheckBox->setDisabled(false);
+		subdivisionButton->setDisabled(false);
+		m_wEnableLodCheckBox->setDisabled(false);
+		m_wLodSettingsButton->setDisabled(false);
+	}
+	else
+	{
+		subdivisionEnabledCheckBox->setChecked(false);
+		subdivisionEnabledCheckBox->setDisabled(true);
+		subdivisionButton->setDisabled(true);
+		m_wEnableLodCheckBox->setChecked(false);
+		m_wEnableLodCheckBox->setDisabled(true);
+		m_wLodSettingsButton->setDisabled(true);
+	}
+
+}
+
+void DzBridgeDialog::HandleExperimentalOptionsCheckBoxClicked()
+{
+	if (m_enableExperimentalOptionsCheckBox->isChecked())
+	{
+		QMessageBox::StandardButton reply;
+		reply = QMessageBox::question(this, "Daz Bridge", "Enabling Experimental Options may cause unexpected results.  Are you sure you want to enable Experimental Options?",
+			QMessageBox::Yes | QMessageBox::No);
+		if (reply == QMessageBox::No)
+		{
+			m_enableExperimentalOptionsCheckBox->setChecked(false);
+			return;
+		}
+	}
+
+    // int state = m_enableExperimentalOptionsCheckBox->checkState();
+	// if (settings == nullptr || m_bDontSaveSettings) return;
+	// settings->setValue("EnableExperimentalOptions", state == Qt::Checked);
+
+	// Intentionally saving as unchecked to force users to "opt-in" every time they use experimental features
+	if (settings == nullptr || m_bDontSaveSettings) return;
+	settings->setValue("EnableExperimentalOptions", false);
+
+}
+
+void DzBridgeDialog::HandleLodSettingsButton()
+{
+	DzBridgeLodSettingsDialog* lodSetttingsDialog = DzBridgeLodSettingsDialog::Get(this->m_BridgeAction, this);
+	lodSetttingsDialog->exec();
+}
+
+void DzBridgeDialog::HandleEnableLodCheckBoxChange(int state)
+{
+	if (settings == nullptr || m_bDontSaveSettings) return;
+	settings->setValue("LodEnabled", state == Qt::Checked);
+}
+
+void DzBridgeDialog::showLodRow(bool bShowWidget)
+{
+	if (m_wLodRowLabelWidget == nullptr) return;
+
+	m_wEnableLodCheckBox->setVisible(bShowWidget);
+	m_wLodSettingsButton->setVisible(bShowWidget);
+	m_wLodRowLabelWidget->setVisible(bShowWidget);
+
 }
 
 #include "moc_DzBridgeDialog.cpp"

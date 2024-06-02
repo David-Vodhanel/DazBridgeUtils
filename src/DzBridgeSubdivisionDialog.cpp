@@ -36,6 +36,7 @@
 #include "dzsettings.h"
 #include "dzmorph.h"
 #include "dzgeometry.h"
+#include "dzenumproperty.h"
 
 #include "DzBridgeSubdivisionDialog.h"
 
@@ -293,7 +294,7 @@ DzNode* DzBridgeSubdivisionDialog::FindObject(DzNode* Node, QString Name)
 bool DzBridgeSubdivisionDialog::setSubdivisionLevelByNode(DzNode* Node, int level)
 {
 	if (Node == nullptr)
-		return nullptr;
+		return false;
 
 	DzNode* selection = dzScene->getPrimarySelection();
 	QString searchName = Node->getName();
@@ -320,6 +321,7 @@ void DzBridgeSubdivisionDialog::LockSubdivisionProperties(bool subdivisionEnable
 	foreach(QComboBox* combo, SubdivisionCombos)
 	{
 		QString Name = combo->property("Object").toString();
+		double targetValue = combo->currentText().toDouble();
 		DzNode* ObjectNode = FindObject(Selection, Name);
 		if (ObjectNode)
 		{
@@ -334,19 +336,51 @@ void DzBridgeSubdivisionDialog::LockSubdivisionProperties(bool subdivisionEnable
 				{
 					DzProperty* property = Shape->getProperty(index);
 					DzNumericProperty* numericProperty = qobject_cast<DzNumericProperty*>(property);
+					DzEnumProperty* enumProperty = qobject_cast<DzEnumProperty*>(property);
 					QString propName = property->getName();
+
+					// DB 2023-May-26: fix for native subdivision in target software
+					if (propName == "lodlevel" && enumProperty)
+					{
+						UndoData undo_data;
+						undo_data.originalNumericLockState = enumProperty->isLocked();
+						undo_data.originalNumericValue = enumProperty->getValue();
+						UndoSubdivisionOverrides.insert(enumProperty, undo_data);
+
+						// DB 2023-August-12: bugfix lodlevel, set to correct value for Base Level
+						int numKeys = enumProperty->getNumItems();
+						int baseValue = enumProperty->findItemString("Base");
+						int hdValue = enumProperty->findItemString("High Resolution");
+						if (baseValue == -1)
+						{
+							baseValue = 0;
+						}
+						//// DEBUGGING: enumerate all keys
+ 						//QString lodString = enumProperty->getStringValue();
+						//for (int i = 0; i < numKeys; i++)
+						//{
+						//	lodString = enumProperty->getItem(i);
+						//	dzApp->log(QString("lodlevel[%1]=[%2]").arg(i).arg(lodString));
+						//	printf("DEBUG: lodlevel[%d]=[%s]", i, lodString.toLocal8Bit().constData());
+						//}
+						if (targetValue == 0.0)
+						{
+							// use base mesh resolution
+							enumProperty->setValue(baseValue);
+						}
+
+					}
 					if (propName == "SubDIALevel" && numericProperty)
 					{
 						// DB 2021-09-02: Record data to Unlock/Undo changes
 						UndoData undo_data;
-						undo_data.originalLockState = numericProperty->isLocked();
-						undo_data.originalValue = numericProperty->getDoubleValue();
+						undo_data.originalNumericLockState = numericProperty->isLocked();
+						undo_data.originalNumericValue = numericProperty->getDoubleValue();
 						UndoSubdivisionOverrides.insert(numericProperty, undo_data);
 
 						numericProperty->lock(false);
 						if (subdivisionEnabled)
 						{
-							double targetValue = combo->currentText().toDouble();
 							numericProperty->setDoubleValue(targetValue);
 						}
 						else
@@ -375,8 +409,8 @@ void DzBridgeSubdivisionDialog::UnlockSubdivisionProperties()
 		{
 			UndoData undo_data = undoIterator.value();
 			numericProperty->lock(false);
-			numericProperty->setDoubleValue(undo_data.originalValue);
-			numericProperty->lock(undo_data.originalLockState);
+			numericProperty->setDoubleValue(undo_data.originalNumericValue);
+			numericProperty->lock(undo_data.originalNumericLockState);
 		}
 		undoIterator++;
 	}

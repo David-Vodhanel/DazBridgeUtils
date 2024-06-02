@@ -34,7 +34,9 @@ set(LIB_SRCS
 	DzBridgeAction.cpp
 	DzBridgeMorphSelectionDialog.cpp
 	DzBridgeSubdivisionDialog.cpp
+	DzBridgeLodSettingsDialog.cpp
 	DzBridgeDialog.cpp
+	ImageTools.cpp
 	${QA_SRCS}
 )
 
@@ -44,6 +46,7 @@ add_library(dzbridge-static
 	${OS_SOURCES}
 	${OFBXI_SOURCES}
 	${OSDI_SOURCES}
+	${MLD_SOURCES}
 	${MINI_LIBZIP_SOURCES}
 )
 
@@ -51,6 +54,8 @@ target_include_directories(dzbridge-static
 	PUBLIC
 	${FBX_SDK_INCLUDE}
 	${OPENSUBDIV_INCLUDE}
+	${ALEMBIC_INCLUDE}
+	${IMATH_INCLUDE}
 )
 
 target_link_libraries(dzbridge-static
@@ -76,6 +81,7 @@ add_library(dzbridge-shared
 	${OS_SOURCES}
 	${OFBXI_SOURCES}
 	${OSDI_SOURCES}
+	${MLD_SOURCES}
 	${MINI_LIBZIP_SOURCES}
 	pluginmain.cpp
 	DzBridgeAction_Scriptable.h
@@ -92,6 +98,8 @@ target_include_directories(dzbridge-shared
 	PUBLIC
 	${FBX_SDK_INCLUDE}
 	${OPENSUBDIV_INCLUDE}
+	${ALEMBIC_INCLUDE}
+	${IMATH_INCLUDE}
 )
 
 target_link_libraries(dzbridge-shared
@@ -103,6 +111,8 @@ target_link_libraries(dzbridge-shared
 	${DZSDK_QT_NETWORK_TARGET}
 	${FBX_IMPORT_LIBS}
 	${OPENSUBDIV_LIB}
+	${ALEMBIC_LIB}
+	${IMATH_LIB}
 )
 
 set_target_properties (dzbridge-shared
@@ -119,8 +129,15 @@ target_compile_definitions(dzbridge-shared
 
 endif(NOT USE_DZBRIDGE_SUBMODULE)
 
-target_compile_definitions(dzbridge-static
-	PUBLIC
-	DZ_BRIDGE_STATIC
-	$<$<CONFIG:DEBUG>:UNITTEST_DZBRIDGE>
-)
+if (WIN32)
+	target_compile_definitions(dzbridge-static
+		PUBLIC
+		DZ_BRIDGE_STATIC
+		$<$<CONFIG:DEBUG>:UNITTEST_DZBRIDGE>
+	)
+elseif (APPLE)
+	target_compile_definitions(dzbridge-static
+		PUBLIC
+		DZ_BRIDGE_STATIC
+	)
+endif()

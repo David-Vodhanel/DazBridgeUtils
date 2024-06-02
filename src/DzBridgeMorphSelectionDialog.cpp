@@ -45,6 +45,7 @@
 
 #include "DzBridgeMorphSelectionDialog.h"
 #include "DzBridgeAction.h"
+#include "DzBridgeDialog.h"
 
 /*****************************
 Local definitions
@@ -54,6 +55,25 @@ Local definitions
 using namespace DzBridgeNameSpace;
 
 CPP_Export DzBridgeMorphSelectionDialog* DzBridgeMorphSelectionDialog::singleton = nullptr;
+
+DzBridgeMorphSelectionDialog* DzBridgeMorphSelectionDialog::Get(QWidget* Parent)
+{
+	if (singleton == nullptr)
+	{
+		// Crash fix
+		if (dzApp->isClosing())
+		{
+			dzApp->log("WARNING: DzBridgeMorphSelectionDialog::Get() called during Daz Studio shutdown.");
+			return nullptr;
+		}
+		singleton = new DzBridgeMorphSelectionDialog(Parent);
+	}
+	else
+	{
+		singleton->PrepareDialog();
+	}
+	return singleton;
+}
 
 // For sorting the lists
 class SortingListItem : public QListWidgetItem {
@@ -72,7 +92,20 @@ public:
 DzBridgeMorphSelectionDialog::DzBridgeMorphSelectionDialog(QWidget *parent) :
 	DzBasicDialog(parent, DAZ_BRIDGE_LIBRARY_NAME)
 {
-	 settings = new QSettings("Daz 3D", "DazToUnreal");
+	connect(this, SIGNAL(accepted()), this, SLOT(HandleDialogAccepted()));
+
+	// Try to retrieve settings from parent dialog
+	DzBridgeDialog* bridgeDialog = qobject_cast<DzBridgeDialog*>(parent);
+	if (bridgeDialog != nullptr)
+	{
+		settings = bridgeDialog->getSettings();
+	}
+	else
+	{
+		settings = new QSettings("Daz 3D", "Morph Selection Dialog");
+	}
+
+	presetsFolder = QDesktopServices::storageLocation(QDesktopServices::DocumentsLocation) + QDir::separator() + "DAZ 3D" + QDir::separator() + "Bridges" + QDir::separator() + "Morph Selection Presets";
 
 	 morphListWidget = NULL;
 	 morphExportListWidget = NULL;
@@ -82,12 +115,8 @@ DzBridgeMorphSelectionDialog::DzBridgeMorphSelectionDialog(QWidget *parent) :
 	 fullBodyMorphTreeItem = NULL;
 	 charactersTreeItem = NULL;
 
-	// Set the dialog title 
+	// Set the dialog title
 	setWindowTitle(tr("Select Morphs"));
-
-	// Setup folder
-	presetsFolder = QDesktopServices::storageLocation(QDesktopServices::DocumentsLocation) + QDir::separator() + "DAZ 3D"+ QDir::separator() + "Bridges" + QDir::separator() + "Daz To Unreal" + QDir::separator() + "Presets";
-
 
 	QVBoxLayout* mainLayout = new QVBoxLayout();
 
@@ -140,14 +169,35 @@ DzBridgeMorphSelectionDialog::DzBridgeMorphSelectionDialog(QWidget *parent) :
 	QPushButton* ArmsJCMButton = new QPushButton("Arms");
 	QPushButton* LegsJCMButton = new QPushButton("Legs");
 	QPushButton* TorsoJCMButton = new QPushButton("Torso");
-	QPushButton* ARKit81Button = new QPushButton("ARKit (Genesis8.1)");
+	QPushButton* ARKit81Button = new QPushButton("ARKit/FACS (Genesis8.1+9)");
 	QPushButton* FaceFX8Button = new QPushButton("FaceFX (Genesis8)");
 
 	autoJCMCheckBox = new QCheckBox("Auto JCM");
 	autoJCMCheckBox->setChecked(false);
 	autoJCMCheckBox->setVisible(false);
 
-	QPushButton* AddConnectedMorphsButton = new QPushButton("Add Connected Morphs");
+	fakeDualQuatCheckBox = new QCheckBox("Fake Dual Quat");
+	fakeDualQuatCheckBox->setChecked(false);
+	fakeDualQuatCheckBox->setVisible(false);
+	fakeDualQuatCheckBox->setWhatsThis("Adds additional JCMs that fake the difference between Linear Blending and Dual Quaternion Skinning.");
+
+	allowMorphDoubleDippingCheckBox = new QCheckBox(tr("Allow Morph Double-Dipping"));
+	allowMorphDoubleDippingCheckBox->setChecked(false);
+	allowMorphDoubleDippingCheckBox->setVisible(true);
+	QString sAllowDoubleDippingHelpText = QString(tr("\
+Allow Connected Morphs such as Victoria 9 and Victoria 9 Head and Victoria 9 Body to all fully contribute \n\
+to the exported blendshape when they are exported simultaneously. \n\n\
+WARNING: this will cause 200% or similar morph distortion when they are all applied together and may break \n\
+functionality for some Morph and JCM products.\
+"));
+	allowMorphDoubleDippingCheckBox->setWhatsThis(sAllowDoubleDippingHelpText);
+	allowMorphDoubleDippingCheckBox->setToolTip(sAllowDoubleDippingHelpText);
+
+	addConnectedMorphsButton = new QPushButton("Add Connected Morphs");
+	addConnectedMorphsButton->setVisible(false);
+	QString sAddConnectedMorphsHelpText = QString(tr("Add any morphs or property sliders which can contribute to strength of exported morphs."));
+	addConnectedMorphsButton->setWhatsThis(sAddConnectedMorphsHelpText);
+	addConnectedMorphsButton->setToolTip(sAddConnectedMorphsHelpText);
 
 	((QGridLayout*)JCMGroupBox->layout())->addWidget(ArmsJCMButton, 0, 0);
 	((QGridLayout*)JCMGroupBox->layout())->addWidget(LegsJCMButton, 0, 1);
@@ -158,21 +208,29 @@ DzBridgeMorphSelectionDialog::DzBridgeMorphSelectionDialog(QWidget *parent) :
 	MorphGroupBox->layout()->addWidget(JCMGroupBox);
 	MorphGroupBox->layout()->addWidget(FaceGroupBox);
 	MorphGroupBox->layout()->addWidget(autoJCMCheckBox);
-	MorphGroupBox->layout()->addWidget(AddConnectedMorphsButton);
+	MorphGroupBox->layout()->addWidget(fakeDualQuatCheckBox);
+	MorphGroupBox->layout()->addWidget(addConnectedMorphsButton);
+	MorphGroupBox->layout()->addWidget(allowMorphDoubleDippingCheckBox);
 
 	if (!settings->value("AutoJCMEnabled").isNull())
 	{
 		autoJCMCheckBox->setChecked(settings->value("AutoJCMEnabled").toBool());
 	}
-	
+
+	if (!settings->value("FakeDualQuatEnabled").isNull())
+	{
+		fakeDualQuatCheckBox->setChecked(settings->value("FakeDualQuatEnabled").toBool());
+	}
+
 	connect(ArmsJCMButton, SIGNAL(released()), this, SLOT(HandleArmJCMMorphsButton()));
 	connect(LegsJCMButton, SIGNAL(released()), this, SLOT(HandleLegJCMMorphsButton()));
 	connect(TorsoJCMButton, SIGNAL(released()), this, SLOT(HandleTorsoJCMMorphsButton()));
 	connect(ARKit81Button, SIGNAL(released()), this, SLOT(HandleARKitGenesis81MorphsButton()));
 	connect(FaceFX8Button, SIGNAL(released()), this, SLOT(HandleFaceFXGenesis8Button()));
 	connect(autoJCMCheckBox, SIGNAL(clicked(bool)), this, SLOT(HandleAutoJCMCheckBoxChange(bool)));
-	connect(AddConnectedMorphsButton, SIGNAL(clicked(bool)), this, SLOT(HandleAddConnectedMorphs()));
-	
+	connect(fakeDualQuatCheckBox, SIGNAL(clicked(bool)), this, SLOT(HandleFakeDualQuatCheckBoxChange(bool)));
+	connect(addConnectedMorphsButton, SIGNAL(clicked(bool)), this, SLOT(HandleAddConnectedMorphs()));
+
 	treeLayout->addWidget(MorphGroupBox);
 	morphsLayout->addLayout(treeLayout);
 
@@ -226,6 +284,10 @@ QSize DzBridgeMorphSelectionDialog::minimumSizeHint() const
 void DzBridgeMorphSelectionDialog::PrepareDialog()
 {
 	DzNode* Selection = dzScene->getPrimarySelection();
+	if (Selection == nullptr)
+	{
+		return;
+	}
 
 	// For items like clothing, create the morph list from the character
 	DzNode* ParentFigureNode = Selection;
@@ -242,18 +304,20 @@ void DzBridgeMorphSelectionDialog::PrepareDialog()
 		}
 	}
 
-	morphs.clear();
-	morphList = GetAvailableMorphs(Selection);
+	// clear and repopulate m_morphInfoMap / left-most pane
+	m_morphInfoMap.clear();
+	GetAvailableMorphs(Selection);
 	for (int ChildIndex = 0; ChildIndex < Selection->getNumNodeChildren(); ChildIndex++)
 	{
 		DzNode* ChildNode = Selection->getNodeChild(ChildIndex);
-		morphList.append(GetAvailableMorphs(ChildNode));
+		GetAvailableMorphs(ChildNode);
 	}
 
-	//GetActiveJointControlledMorphs(Selection);
-
 	UpdateMorphsTree();
+	RefreshPresetsCombo();
 	HandlePresetChanged("LastUsed.csv");
+	// DB (2022-Sept-26): crashfix for changed selection and export without opening morph selection dialog
+	HandleDialogAccepted(false);
 }
 
 // When the filter text is changed, update the center list
@@ -302,30 +366,31 @@ QStringList DzBridgeMorphSelectionDialog::GetAvailableMorphs(DzNode* Node)
 			morphInfo.Type = presentation->getType();
 			morphInfo.Property = property;
 			morphInfo.Node = Node;
-			if (!morphs.contains(morphInfo.Name))
+			if (!m_morphInfoMap.contains(morphInfo.Name))
 			{
-				morphs.insert(morphInfo.Name, morphInfo);
+				m_morphInfoMap.insert(morphInfo.Name, morphInfo);
 			}
 			//qDebug() << "Property Name " << propName << " Label " << propLabel << " Presentation Type:" << presentation->getType() << "Path: " << property->getPath();
 			//qDebug() << "Path " << property->getGroupOnlyPath();
 		}
-		if (presentation && presentation->getType() == "Modifier/Shape")
-		{
-			SortingListItem* item = new SortingListItem();// modLabel, morphListWidget);
-			item->setText(propLabel);
-			item->setFlags(item->flags() | Qt::ItemIsUserCheckable);
-			if (morphList.contains(propLabel))
-			{
-				item->setCheckState(Qt::Checked);
-				newMorphList.append(propName);
-			}
-			else
-			{
-				item->setCheckState(Qt::Unchecked);
-			}
-			item->setData(Qt::UserRole, propName);
-			morphNameMapping.insert(propName, propLabel);
-		}
+		// DB (2022-Sept-24): This appears to be dead code.  All active data now stored in m_morphInfoMap, commenting out.
+		//if (presentation && presentation->getType() == "Modifier/Shape")
+		//{
+		//	SortingListItem* item = new SortingListItem();// modLabel, morphListWidget);
+		//	item->setText(propLabel);
+		//	item->setFlags(item->flags() | Qt::ItemIsUserCheckable);
+		//	if (morphList.contains(propLabel))
+		//	{
+		//		item->setCheckState(Qt::Checked);
+		//		newMorphList.append(propName);
+		//	}
+		//	else
+		//	{
+		//		item->setCheckState(Qt::Unchecked);
+		//	}
+		//	item->setData(Qt::UserRole, propName);
+		//	morphNameMapping.insert(propName, propLabel);
+		//}
 	}
 
 	if (Object)
@@ -353,28 +418,44 @@ QStringList DzBridgeMorphSelectionDialog::GetAvailableMorphs(DzNode* Node)
 						morphInfoProp.Type = presentation->getType();
 						morphInfoProp.Property = property;
 						morphInfoProp.Node = Node;
-						if (!morphs.contains(morphInfoProp.Name))
+						if (!m_morphInfoMap.contains(morphInfoProp.Name))
 						{
-							morphs.insert(morphInfoProp.Name, morphInfoProp);
+							m_morphInfoMap.insert(morphInfoProp.Name, morphInfoProp);
 						}
 						//qDebug() << "Modifier Name " << modName << " Label " << propLabel << " Presentation Type:" << presentation->getType() << " Path: " << property->getPath();
 						//qDebug() << "Path " << property->getGroupOnlyPath();
 					}
 				}
-				
+
 			}
 
 		}
 	}
-	
+
 	return newMorphList;
+}
+
+void DzBridgeMorphSelectionDialog::AddActiveJointControlledMorphs(DzNode* Node)
+{
+	QList<JointLinkInfo> activeMorphs = GetActiveJointControlledMorphs(Node);
+
+	for (JointLinkInfo linkInfo : activeMorphs)
+	{
+		QString linkLabel = linkInfo.Morph;
+
+		if (m_morphInfoMap.contains(linkLabel) && !m_morphsToExport_finalized.contains(m_morphInfoMap[linkLabel]))
+		{
+			m_morphsToExport_finalized.append(m_morphInfoMap[linkLabel]);
+		}
+	}
+
 }
 
 // Recursive function for finding all active JCM morphs for a node
 QList<JointLinkInfo> DzBridgeMorphSelectionDialog::GetActiveJointControlledMorphs(DzNode* Node)
 {
 	QList<JointLinkInfo> returnMorphs;
-	if (autoJCMCheckBox->isChecked())
+	if (IsAutoJCMEnabled())
 	{
 		if (Node == nullptr)
 		{
@@ -395,7 +476,6 @@ QList<JointLinkInfo> DzBridgeMorphSelectionDialog::GetActiveJointControlledMorph
 				}
 			}
 		}
-
 
 		DzObject* Object = Node->getObject();
 		DzShape* Shape = Object ? Object->getCurrentShape() : NULL;
@@ -439,7 +519,13 @@ QList<JointLinkInfo> DzBridgeMorphSelectionDialog::GetJointControlledMorphInfo(D
 	QString propName = property->getName();
 	QString propLabel = property->getLabel();
 	DzPresentation* presentation = property->getPresentation();
-	if (presentation && presentation->getType() == "Modifier/Corrective")
+	// DB 2023-Sep-20: 
+	// This code prematurely filters out morphs based on their categorization.  However, it assumes that the categorization
+	// is always correct.  Work-around to account for miscategorized DzMorphs with ERC Links: just filter specifically by
+	// ERC bone link presence and ignore presentation type altogether.
+	// TODO: consider filtering property Owner by DzMorph inheritance, but this may also prematurely exclude some JCMs
+//	if (presentation && presentation->getType() == "Modifier/Corrective")
+	if (true)
 	{
 		QString linkLabel;
 		QString linkDescription;
@@ -450,6 +536,7 @@ QList<JointLinkInfo> DzBridgeMorphSelectionDialog::GetJointControlledMorphInfo(D
 		double currentBodyScalar = 0.0f;
 		double linkScalar = 0.0f;
 		bool isJCM = false;
+		bool isBaseJCM = false;
 		QList<double> keys;
 		QList<double> keysValues;
 		QList<JointLinkKey> linkKeys;
@@ -494,6 +581,11 @@ QList<JointLinkInfo> DzBridgeMorphSelectionDialog::GetJointControlledMorphInfo(D
 					linkBodyType = linkObject;
 					bodyStrength = value;
 					currentBodyScalar = currentValue;
+					if (linkProperty == "body_ctrl_basejointcorrectives" ||
+						linkProperty == "BaseJointCorrectives")
+					{
+						isBaseJCM = true;
+					}
 				}
 			}
 		}
@@ -507,17 +599,24 @@ QList<JointLinkInfo> DzBridgeMorphSelectionDialog::GetJointControlledMorphInfo(D
 			linkInfo.Scalar = linkScalar;
 			linkInfo.Alpha = currentBodyScalar;
 			linkInfo.Keys = linkKeys;
-			qDebug() << "Label " << linkLabel << " Description " << linkDescription << " Bone " << linkBone << " Axis " << linkAxis << " Alpha " << currentBodyScalar << " Scalar " << linkScalar;
+			linkInfo.IsBaseJCM = isBaseJCM;
+
+			if (m_morphInfoMap.contains(linkLabel))
+			{
+				linkInfo.LinkMorphInfo = m_morphInfoMap[linkLabel];
+			}
+
+			//qDebug() << "Label " << linkLabel << " Description " << linkDescription << " Bone " << linkBone << " Axis " << linkAxis << " Alpha " << currentBodyScalar << " Scalar " << linkScalar;
 			if (!keys.isEmpty())
 			{
 				foreach(double key, keys)
 				{
-					qDebug() << key;
+					//qDebug() << key;
 				}
 
 				foreach(double key, keysValues)
 				{
-					qDebug() << key;
+					//qDebug() << key;
 				}
 
 			}
@@ -534,9 +633,9 @@ void DzBridgeMorphSelectionDialog::UpdateMorphsTree()
 {
 	morphTreeWidget->clear();
 	morphsForNode.clear();
-	foreach(QString morph, morphs.keys())
+	foreach(QString morph, m_morphInfoMap.keys())
 	{
-		QString path = morphs[morph].Path;
+		QString path = m_morphInfoMap[morph].Path;
 		QTreeWidgetItem* parentItem = nullptr;
 		foreach(QString pathPart, path.split("/"))
 		{
@@ -547,7 +646,7 @@ void DzBridgeMorphSelectionDialog::UpdateMorphsTree()
 			{
 				morphsForNode.insert(parentItem, QList<MorphInfo>());
 			}
-			morphsForNode[parentItem].append(morphs[morph]);
+			morphsForNode[parentItem].append(m_morphInfoMap[morph]);
 		}
 	}
 }
@@ -620,13 +719,12 @@ void DzBridgeMorphSelectionDialog::HandleAddMorphsButton()
 	foreach(QListWidgetItem* selectedItem, morphListWidget->selectedItems())
 	{
 		QString morphName = selectedItem->data(Qt::UserRole).toString();
-		if (morphs.contains(morphName) && !morphsToExport.contains(morphs[morphName]))
+		if (m_morphInfoMap.contains(morphName) && !m_morphsToExport.contains(m_morphInfoMap[morphName]))
 		{
-			morphsToExport.append(morphs[morphName]);
+			m_morphsToExport.append(m_morphInfoMap[morphName]);
 		}
 	}
 	RefreshExportMorphList();
-	RefreshPresetsCombo();
 }
 
 // Remove morph from export list
@@ -635,13 +733,12 @@ void DzBridgeMorphSelectionDialog::HandleRemoveMorphsButton()
 	foreach(QListWidgetItem* selectedItem, morphExportListWidget->selectedItems())
 	{
 		QString morphName = selectedItem->data(Qt::UserRole).toString();
-		if (morphs.keys().contains(morphName))
+		if (m_morphInfoMap.keys().contains(morphName))
 		{
-			morphsToExport.removeAll(morphs[morphName]);
+			m_morphsToExport.removeAll(m_morphInfoMap[morphName]);
 		}
 	}
 	RefreshExportMorphList();
-	RefreshPresetsCombo();
 }
 
 // Brings up a dialgo for choosing a preset name
@@ -676,7 +773,7 @@ void DzBridgeMorphSelectionDialog::SavePresetFile(QString filePath)
 	QFile file(filePath);
 	file.open(QIODevice::WriteOnly | QIODevice::Text);
 	QTextStream out(&file);
-	out << GetMorphCSVString();
+	out << GetMorphCSVString(false);
 
 	// optional, as QFile destructor will already do it:
 	file.close();
@@ -690,6 +787,7 @@ void DzBridgeMorphSelectionDialog::HandleArmJCMMorphsButton()
 {
 	QStringList MorphsToAdd;
 
+	// Genesis 8
 	MorphsToAdd.append("pJCMCollarTwist_n30_L");
 	MorphsToAdd.append("pJCMCollarTwist_n30_R");
 	MorphsToAdd.append("pJCMCollarTwist_p30_L");
@@ -727,12 +825,76 @@ void DzBridgeMorphSelectionDialog::HandleArmJCMMorphsButton()
 	MorphsToAdd.append("pJCMShldrUp_35_L");
 	MorphsToAdd.append("pJCMShldrUp_35_R");
 
+	// Genesis 9
+	MorphsToAdd.append("body_cbs_forearm_y135n_l");
+	MorphsToAdd.append("body_cbs_forearm_y135p_r");
+	MorphsToAdd.append("body_cbs_forearm_y75n_l");
+	MorphsToAdd.append("body_cbs_forearm_y75p_r");
+	MorphsToAdd.append("body_cbs_hand_y28n_l");
+	MorphsToAdd.append("body_cbs_hand_y28p_r");
+	MorphsToAdd.append("body_cbs_hand_z70n_l");
+	MorphsToAdd.append("body_cbs_hand_z70p_r");
+	MorphsToAdd.append("body_cbs_hand_z80n_r");
+	MorphsToAdd.append("body_cbs_hand_z80p_l");
+	MorphsToAdd.append("body_cbs_index1_z90n_l");
+	MorphsToAdd.append("body_cbs_index1_z90p_r");
+	MorphsToAdd.append("body_cbs_index2_z105n_l");
+	MorphsToAdd.append("body_cbs_index2_z105p_r");
+	MorphsToAdd.append("body_cbs_index3_z90n_l");
+	MorphsToAdd.append("body_cbs_index3_z90p_r");
+	MorphsToAdd.append("body_cbs_mid1_z95n_l");
+	MorphsToAdd.append("body_cbs_mid1_z95p_r");
+	MorphsToAdd.append("body_cbs_mid2_z105n_l");
+	MorphsToAdd.append("body_cbs_mid2_z105p_r");
+	MorphsToAdd.append("body_cbs_mid3_z90n_l");
+	MorphsToAdd.append("body_cbs_mid3_z90p_r");
+	MorphsToAdd.append("body_cbs_pinky1_z95n_l");
+	MorphsToAdd.append("body_cbs_pinky1_z95p_r");
+	MorphsToAdd.append("body_cbs_pinky2_z105n_l");
+	MorphsToAdd.append("body_cbs_pinky2_z105p_r");
+	MorphsToAdd.append("body_cbs_pinky3_z90n_l");
+	MorphsToAdd.append("body_cbs_pinky3_z90p_r");
+	MorphsToAdd.append("body_cbs_ring1_z95n_l");
+	MorphsToAdd.append("body_cbs_ring1_z95p_r");
+	MorphsToAdd.append("body_cbs_ring2_z105n_l");
+	MorphsToAdd.append("body_cbs_ring2_z105p_r");
+	MorphsToAdd.append("body_cbs_ring3_z90n_l");
+	MorphsToAdd.append("body_cbs_ring3_z90p_r");
+	MorphsToAdd.append("body_cbs_shoulder_x30n_l");
+	MorphsToAdd.append("body_cbs_shoulder_x30n_r");
+	MorphsToAdd.append("body_cbs_shoulder_x30p_l");
+	MorphsToAdd.append("body_cbs_shoulder_x30p_r");
+	MorphsToAdd.append("body_cbs_shoulder_z55n_r");
+	MorphsToAdd.append("body_cbs_shoulder_z55n_r_COR");
+	MorphsToAdd.append("body_cbs_shoulder_z55p_l");
+	MorphsToAdd.append("body_cbs_shoulder_z55p_l_COR");
+	MorphsToAdd.append("body_cbs_thumb1_y40n_r");
+	MorphsToAdd.append("body_cbs_thumb1_y40p_l");
+	MorphsToAdd.append("body_cbs_thumb1_z20n_r");
+	MorphsToAdd.append("body_cbs_thumb1_z20p_l");
+	MorphsToAdd.append("body_cbs_thumb2_y65n_r");
+	MorphsToAdd.append("body_cbs_thumb2_y65p_l");
+	MorphsToAdd.append("body_cbs_thumb3_y90n_r");
+	MorphsToAdd.append("body_cbs_thumb3_y90p_l");
+	MorphsToAdd.append("body_cbs_upperarm_x95n_l");
+	MorphsToAdd.append("body_cbs_upperarm_x95n_r");
+	MorphsToAdd.append("body_cbs_upperarm_y110n_l");
+	MorphsToAdd.append("body_cbs_upperarm_y110n_z40n_l");
+	MorphsToAdd.append("body_cbs_upperarm_y110n_z90p_l");
+	MorphsToAdd.append("body_cbs_upperarm_y110p_r");
+	MorphsToAdd.append("body_cbs_upperarm_y110p_z40p_r");
+	MorphsToAdd.append("body_cbs_upperarm_y110p_z90n_r");
+	MorphsToAdd.append("body_cbs_upperarm_z40n_l");
+	MorphsToAdd.append("body_cbs_upperarm_z40p_r");
+	MorphsToAdd.append("body_cbs_upperarm_z90n_r");
+	MorphsToAdd.append("body_cbs_upperarm_z90p_l");
+
 	// Add the list for export
 	foreach(QString MorphName, MorphsToAdd)
 	{
-		if (morphs.contains(MorphName) && !morphsToExport.contains(morphs[MorphName]))
+		if (m_morphInfoMap.contains(MorphName) && !m_morphsToExport.contains(m_morphInfoMap[MorphName]))
 		{
-			morphsToExport.append(morphs[MorphName]);
+			m_morphsToExport.append(m_morphInfoMap[MorphName]);
 		}
 	}
 	RefreshExportMorphList();
@@ -744,6 +906,7 @@ void DzBridgeMorphSelectionDialog::HandleLegJCMMorphsButton()
 {
 	QStringList MorphsToAdd;
 
+	// Genesis 8
 	MorphsToAdd.append("pJCMBigToeDown_45_L");
 	MorphsToAdd.append("pJCMBigToeDown_45_R");
 	MorphsToAdd.append("pJCMFootDwn_75_L");
@@ -765,12 +928,38 @@ void DzBridgeMorphSelectionDialog::HandleLegJCMMorphsButton()
 	MorphsToAdd.append("pJCMToesUp_60_L");
 	MorphsToAdd.append("pJCMToesUp_60_R");
 
+	// Genesis 9
+	MorphsToAdd.append("body_cbs_foot_x45n_l");
+	MorphsToAdd.append("body_cbs_foot_x45n_r");
+	MorphsToAdd.append("body_cbs_foot_x65p_l");
+	MorphsToAdd.append("body_cbs_foot_x65p_r");
+	MorphsToAdd.append("body_cbs_foot_z45n_l");
+	MorphsToAdd.append("body_cbs_foot_z45p_r");
+	MorphsToAdd.append("body_cbs_shin_x155p_l");
+	MorphsToAdd.append("body_cbs_shin_x155p_r");
+	MorphsToAdd.append("body_cbs_shin_x90p_l");
+	MorphsToAdd.append("body_cbs_shin_x90p_r");
+	MorphsToAdd.append("body_cbs_thigh_x115n_l");
+	MorphsToAdd.append("body_cbs_thigh_x115n_r");
+	MorphsToAdd.append("body_cbs_thigh_x115n_z90n_r");
+	MorphsToAdd.append("body_cbs_thigh_x115n_z90p_l");
+	MorphsToAdd.append("body_cbs_thigh_x35p_l");
+	MorphsToAdd.append("body_cbs_thigh_x35p_r");
+	MorphsToAdd.append("body_cbs_thigh_x90n_l");
+	MorphsToAdd.append("body_cbs_thigh_x90n_r");
+	MorphsToAdd.append("body_cbs_thigh_z90n_r");
+	MorphsToAdd.append("body_cbs_thigh_z90p_l");
+	MorphsToAdd.append("body_cbs_toes_x40p_l");
+	MorphsToAdd.append("body_cbs_toes_x40p_r");
+	MorphsToAdd.append("body_cbs_toes_x60n_l");
+	MorphsToAdd.append("body_cbs_toes_x60n_r");
+
 	// Add the list for export
 	foreach(QString MorphName, MorphsToAdd)
 	{
-		if (morphs.contains(MorphName) && !morphsToExport.contains(morphs[MorphName]))
+		if (m_morphInfoMap.contains(MorphName) && !m_morphsToExport.contains(m_morphInfoMap[MorphName]))
 		{
-			morphsToExport.append(morphs[MorphName]);
+			m_morphsToExport.append(m_morphInfoMap[MorphName]);
 		}
 	}
 	RefreshExportMorphList();
@@ -782,6 +971,7 @@ void DzBridgeMorphSelectionDialog::HandleTorsoJCMMorphsButton()
 {
 	QStringList MorphsToAdd;
 
+	// Genesis 8
 	MorphsToAdd.append("pJCMAbdomen2Fwd_40");
 	MorphsToAdd.append("pJCMAbdomen2Side_24_L");
 	MorphsToAdd.append("pJCMAbdomen2Side_24_R");
@@ -802,15 +992,244 @@ void DzBridgeMorphSelectionDialog::HandleTorsoJCMMorphsButton()
 	MorphsToAdd.append("pJCMChestSide_20_L");
 	MorphsToAdd.append("pJCMChestSide_20_R");
 
+	// Genesis 9
+	MorphsToAdd.append("body_cbs_head_x25p");
+	MorphsToAdd.append("body_cbs_head_x30n");
+	MorphsToAdd.append("body_cbs_neck1_x25n");
+	MorphsToAdd.append("body_cbs_neck1_x40p");
+	MorphsToAdd.append("body_cbs_neck1_x40p_COR");
+	MorphsToAdd.append("body_cbs_neck1_y22n_r");
+	MorphsToAdd.append("body_cbs_neck1_y22p_l");
+	MorphsToAdd.append("body_cbs_neck1_z40n_l");
+	MorphsToAdd.append("body_cbs_neck1_z40n_l_COR");
+	MorphsToAdd.append("body_cbs_neck1_z40p_r");
+	MorphsToAdd.append("body_cbs_neck1_z40p_r_COR");
+	MorphsToAdd.append("body_cbs_pelvis_x25n");
+	MorphsToAdd.append("body_cbs_pelvis_x25p");
+	MorphsToAdd.append("body_cbs_spine1_x35p");
+	MorphsToAdd.append("body_cbs_spine1_z15n_l");
+	MorphsToAdd.append("body_cbs_spine1_z15p_r");
+	MorphsToAdd.append("body_cbs_spine2_x40p");
+	MorphsToAdd.append("body_cbs_spine2_z24n_l");
+	MorphsToAdd.append("body_cbs_spine2_z24p_r");
+	MorphsToAdd.append("body_cbs_spine3_x35p");
+	MorphsToAdd.append("body_cbs_spine3_z20n_l");
+	MorphsToAdd.append("body_cbs_spine3_z20p_r");
+	MorphsToAdd.append("body_ctrl_pecmovement_l");
+	MorphsToAdd.append("body_ctrl_pecmovement_r");
+
 	// Add the list for export
 	foreach(QString MorphName, MorphsToAdd)
 	{
-		if (morphs.contains(MorphName) && !morphsToExport.contains(morphs[MorphName]))
+		if (m_morphInfoMap.contains(MorphName) && !m_morphsToExport.contains(m_morphInfoMap[MorphName]))
 		{
-			morphsToExport.append(morphs[MorphName]);
+			m_morphsToExport.append(m_morphInfoMap[MorphName]);
 		}
 	}
 	RefreshExportMorphList();
+}
+
+// Genesis 9 FACS blendshapes, blendshape selection for use with WonderStudio
+void DzBridgeMorphSelectionDialog::addGenesis9FACS(QStringList& MorphsToAdd)
+{
+	MorphsToAdd.append("facs_bs_BrowInnerUpLeft");
+	MorphsToAdd.append("facs_bs_BrowInnerUpRight");
+	MorphsToAdd.append("facs_bs_BrowOuterUpLeft");
+	MorphsToAdd.append("facs_bs_BrowOuterUpRight");
+	MorphsToAdd.append("facs_bs_BrowSqueezeLeft");
+	MorphsToAdd.append("facs_bs_BrowSqueezeRight");
+	MorphsToAdd.append("facs_bs_CheekPuffLeft");
+	MorphsToAdd.append("facs_bs_CheekPuffRight");
+	MorphsToAdd.append("facs_bs_CheekSquintLeft");
+	MorphsToAdd.append("facs_bs_CheekSquintRight");
+	MorphsToAdd.append("facs_bs_EyeBlinkLeft");
+	MorphsToAdd.append("facs_bs_EyeBlinkRight");
+	MorphsToAdd.append("facs_bs_EyelidOpenLowerLeft");
+	MorphsToAdd.append("facs_bs_EyelidOpenLowerRight");
+	MorphsToAdd.append("facs_bs_EyelidOpenUpperLeft");
+	MorphsToAdd.append("facs_bs_EyelidOpenUpperRight");
+	MorphsToAdd.append("facs_bs_EyeLookUpLeft");
+	MorphsToAdd.append("facs_bs_EyeLookUpRight");
+	MorphsToAdd.append("facs_bs_EyeSquintLeft");
+	MorphsToAdd.append("facs_bs_EyeSquintRight");
+	MorphsToAdd.append("facs_bs_JawForward");
+	MorphsToAdd.append("facs_bs_JawLeft");
+	MorphsToAdd.append("facs_bs_JawOpen");
+	MorphsToAdd.append("facs_bs_JawRecess");
+	MorphsToAdd.append("facs_bs_JawRight");
+	MorphsToAdd.append("facs_bs_MouthCornerMoveSide-SideLeft");
+	MorphsToAdd.append("facs_bs_MouthCornerMoveSide-SideRight");
+	MorphsToAdd.append("facs_bs_MouthDimpleLeft");
+	MorphsToAdd.append("facs_bs_MouthDimpleRight");
+	MorphsToAdd.append("facs_bs_MouthFrownLeft");
+	MorphsToAdd.append("facs_bs_MouthFrownRight");
+	MorphsToAdd.append("facs_bs_MouthLeft");
+	MorphsToAdd.append("facs_bs_MouthLowerDownLeft");
+	MorphsToAdd.append("facs_bs_MouthLowerDownRight");
+	MorphsToAdd.append("facs_bs_MouthRight");
+	MorphsToAdd.append("facs_bs_MouthRollLowerLeft");
+	MorphsToAdd.append("facs_bs_MouthRollLowerRight");
+	MorphsToAdd.append("facs_bs_MouthSmileLeft");
+	MorphsToAdd.append("facs_bs_MouthSmileLeft");
+	MorphsToAdd.append("facs_bs_MouthSmileRight");
+	MorphsToAdd.append("facs_bs_MouthSmileRight");
+	MorphsToAdd.append("facs_bs_MouthUpperUpLeft");
+	MorphsToAdd.append("facs_bs_MouthUpperUpRight");
+	MorphsToAdd.append("facs_bs_NoseSneerLeft");
+	MorphsToAdd.append("facs_bs_NoseSneerRight");
+	MorphsToAdd.append("facs_cbs_EyeFullCompressionLeft");
+	MorphsToAdd.append("facs_cbs_EyeFullCompressionRight");
+	MorphsToAdd.append("facs_ctrl_MouthPressLeft");
+	MorphsToAdd.append("facs_ctrl_MouthPressLeft");
+	MorphsToAdd.append("facs_ctrl_MouthPressRight");
+	MorphsToAdd.append("facs_ctrl_MouthPressRight");
+	MorphsToAdd.append("facs_ctrl_MouthPucker");
+	MorphsToAdd.append("facs_ctrl_MouthRollLower");
+	MorphsToAdd.append("facs_ctrl_MouthRollUpper");
+	MorphsToAdd.append("facs_ctrl_MouthStickyControlLeft");
+	MorphsToAdd.append("facs_ctrl_MouthStickyControlRight");
+	MorphsToAdd.append("facs_ctrl_NasalCompress");
+	MorphsToAdd.append("facs_ctrl_NasalFlare");
+	MorphsToAdd.append("facs_bs_BrowDownLeft");
+	MorphsToAdd.append("facs_bs_BrowDownLeft");
+	MorphsToAdd.append("facs_bs_BrowDownRight");
+	MorphsToAdd.append("facs_bs_BrowDownRight");
+	MorphsToAdd.append("facs_bs_EyeLookDownLeft");
+	MorphsToAdd.append("facs_bs_EyeLookDownRight");
+	MorphsToAdd.append("facs_bs_EyeLookInLeft");
+	MorphsToAdd.append("facs_bs_EyeLookOutRight");
+	MorphsToAdd.append("facs_bs_EyeLookInRight");
+	MorphsToAdd.append("facs_bs_EyeLookOutLeft");
+	MorphsToAdd.append("facs_bs_JawChinCompression");
+	MorphsToAdd.append("facs_bs_JawChinCompression");
+	MorphsToAdd.append("facs_bs_MouthCloseLowerLeft");
+	MorphsToAdd.append("facs_bs_MouthCloseLowerRight");
+	MorphsToAdd.append("facs_bs_MouthCloseUpperLeft");
+	MorphsToAdd.append("facs_bs_MouthCloseUpperRight");
+	MorphsToAdd.append("facs_bs_MouthCloseUpperLeft");
+	MorphsToAdd.append("facs_bs_MouthForward-BackMiddleUpper");
+	MorphsToAdd.append("facs_bs_MouthForwardUpperLeft");
+	MorphsToAdd.append("facs_bs_MouthCloseUpperRight");
+	MorphsToAdd.append("facs_bs_MouthForward-BackMiddleUpper");
+	MorphsToAdd.append("facs_bs_MouthForwardUpperRight");
+	MorphsToAdd.append("facs_bs_MouthCornerTightnessLowerLeft");
+	MorphsToAdd.append("facs_bs_MouthCornerTightnessLowerRight");
+	MorphsToAdd.append("facs_bs_MouthForwardLowerLeft");
+	MorphsToAdd.append("facs_bs_MouthForwardLowerRight");
+	MorphsToAdd.append("facs_bs_MouthForwardUpperLeft");
+	MorphsToAdd.append("facs_bs_MouthForwardUpperRight");
+	MorphsToAdd.append("facs_bs_MouthFunnelLowerLeft");
+	MorphsToAdd.append("facs_bs_MouthFunnelLowerRight");
+	MorphsToAdd.append("facs_bs_MouthFunnelLowerLeft");
+	MorphsToAdd.append("facs_bs_MouthLowerDownLeft");
+	MorphsToAdd.append("facs_bs_MouthFunnelLowerRight");
+	MorphsToAdd.append("facs_bs_MouthLowerDownRight");
+	MorphsToAdd.append("facs_bs_MouthFunnelUpperLeft");
+	MorphsToAdd.append("facs_bs_MouthFunnelUpperRight");
+	MorphsToAdd.append("facs_bs_MouthLipsSide-SideLower");
+	MorphsToAdd.append("facs_bs_MouthLipsSide-SideUpper");
+	MorphsToAdd.append("facs_bs_MouthLipsSide-SideLower");
+	MorphsToAdd.append("facs_bs_MouthLipsSide-SideUpper");
+	MorphsToAdd.append("facs_bs_MouthPurseLowerLeft");
+	MorphsToAdd.append("facs_bs_MouthPurseUpperLeft");
+	MorphsToAdd.append("facs_bs_MouthPurseLowerRight");
+	MorphsToAdd.append("facs_bs_MouthPurseUpperRight");
+	MorphsToAdd.append("facs_bs_MouthShrugUpperLeft");
+	MorphsToAdd.append("facs_bs_MouthUpperUpLeft");
+	MorphsToAdd.append("facs_bs_MouthShrugUpperRight");
+	MorphsToAdd.append("facs_bs_MouthUpperUpRight");
+	MorphsToAdd.append("facs_bs_MouthSmileLeft");
+	MorphsToAdd.append("facs_bs_MouthSmileWidenLeft");
+	MorphsToAdd.append("facs_bs_MouthLowerDownLeft");
+	MorphsToAdd.append("facs_bs_MouthUpperUpLeft");
+	MorphsToAdd.append("facs_bs_MouthSmileRight");
+	MorphsToAdd.append("facs_bs_MouthSmileWidenRight");
+	MorphsToAdd.append("facs_bs_MouthLowerDownRight");
+	MorphsToAdd.append("facs_bs_MouthUpperUpRight");
+	MorphsToAdd.append("facs_bs_MouthSmileWidenLeft");
+	MorphsToAdd.append("facs_bs_MouthCornerMoveUp-DownLeft");
+	MorphsToAdd.append("facs_bs_MouthSmileWidenRight");
+	MorphsToAdd.append("facs_bs_MouthCornerMoveUp-DownRight");
+	MorphsToAdd.append("facs_bs_NasalFlareLeft");
+	MorphsToAdd.append("facs_bs_NoseSneerLeft");
+	MorphsToAdd.append("facs_bs_NasalCreaseFlexLeft");
+	MorphsToAdd.append("facs_bs_NasalFlareRight");
+	MorphsToAdd.append("facs_bs_NoseSneerRight");
+	MorphsToAdd.append("facs_bs_NasalCreaseFlexRight");
+	MorphsToAdd.append("facs_ctrl_MouthRollLower");
+	MorphsToAdd.append("facs_ctrl_MouthForward-BackLowerLeft");
+	MorphsToAdd.append("facs_ctrl_MouthForward-BackLowerRight");
+	MorphsToAdd.append("facs_bs_MouthForward-BackMiddleLower");
+	MorphsToAdd.append("facs_ctrl_MouthRollUpper");
+	MorphsToAdd.append("facs_bs_MouthForward-BackMiddleUpper");
+	MorphsToAdd.append("facs_ctrl_MouthForward-BackUpperLeft");
+	MorphsToAdd.append("facs_ctrl_MouthForward-BackUpperRight");
+
+}
+
+// Add Genesis8 FACS controls for use by WonderStudio conversion
+void DzBridgeMorphSelectionDialog::addGenesis81FACS(QStringList& MorphsToAdd)
+{
+	MorphsToAdd.append("facs_bs_BrowInnerUpLeft_div2");
+	MorphsToAdd.append("facs_bs_BrowInnerUpRight_div2");
+	MorphsToAdd.append("facs_bs_BrowOuterUpLeft_div2");
+	MorphsToAdd.append("facs_bs_BrowOuterUpRight_div2");
+	MorphsToAdd.append("facs_bs_CheekPuffLeft_div2");
+	MorphsToAdd.append("facs_bs_CheekPuffRight_div2");
+	MorphsToAdd.append("facs_bs_CheekSquintLeft_div2");
+	MorphsToAdd.append("facs_bs_CheekSquintRight_div2");
+	MorphsToAdd.append("facs_bs_EyeSquintLeft_div2");
+	MorphsToAdd.append("facs_bs_EyeSquintRight_div2");
+	MorphsToAdd.append("facs_bs_MouthDimpleLeft_div2");
+	MorphsToAdd.append("facs_bs_MouthDimpleRight_div2");
+	MorphsToAdd.append("facs_bs_MouthFrownLeft_div2");
+	MorphsToAdd.append("facs_bs_MouthFrownRight_div2");
+	MorphsToAdd.append("facs_bs_MouthLeft_div2");
+	MorphsToAdd.append("facs_bs_MouthLowerDownRight_div2");
+	MorphsToAdd.append("facs_bs_MouthLowerDownRight_div2");
+	MorphsToAdd.append("facs_bs_MouthPressLeft_div2");
+	MorphsToAdd.append("facs_bs_MouthPressLeft_div2");
+	MorphsToAdd.append("facs_bs_MouthPressRight_div2");
+	MorphsToAdd.append("facs_bs_MouthPressRight_div2");
+	MorphsToAdd.append("facs_bs_MouthPucker_div2");
+	MorphsToAdd.append("facs_bs_MouthRight_div2");
+	MorphsToAdd.append("facs_bs_MouthRollLower_div2");
+	MorphsToAdd.append("facs_bs_MouthRollUpper_div2");
+	MorphsToAdd.append("facs_bs_MouthSmileLeft_div2");
+	MorphsToAdd.append("facs_bs_MouthSmileLeft_div2");
+	MorphsToAdd.append("facs_bs_MouthSmileRight_div2");
+	MorphsToAdd.append("facs_bs_MouthSmileRight_div2");
+	MorphsToAdd.append("facs_bs_MouthUpperUpLeft_div2");
+	MorphsToAdd.append("facs_bs_MouthUpperUpRight_div2");
+	MorphsToAdd.append("facs_bs_NasalFlare_div2");
+	MorphsToAdd.append("facs_bs_NoseSneerLeft_div2");
+	MorphsToAdd.append("facs_bs_NoseSneerRight_div2");
+	MorphsToAdd.append("facs_cbs_EyeBlinkLeft_div2");
+	MorphsToAdd.append("facs_cbs_EyeBlinkRight_div2");
+	MorphsToAdd.append("facs_jnt_EyeBlinkRight");
+	MorphsToAdd.append("facs_jnt_EyeLookDownLeft");
+	MorphsToAdd.append("facs_jnt_JawLeft");
+	MorphsToAdd.append("facs_jnt_JawOpen");
+	MorphsToAdd.append("facs_jnt_JawOpen");
+	MorphsToAdd.append("facs_jnt_JawRecess");
+	MorphsToAdd.append("facs_jnt_JawRight");
+
+	MorphsToAdd.append("facs_bs_BrowDownLeft_div2");
+	MorphsToAdd.append("facs_bs_BrowDownRight_div2");
+	MorphsToAdd.append("facs_bs_MouthClose_div2");
+	MorphsToAdd.append("facs_bs_MouthFunnel_div2");
+	MorphsToAdd.append("facs_bs_MouthRollLower_div2");
+	MorphsToAdd.append("facs_ctrl_EyeLookDownLeft");
+	MorphsToAdd.append("facs_ctrl_EyeLookDownRight");
+	MorphsToAdd.append("facs_ctrl_EyeLookInLeft");
+	MorphsToAdd.append("facs_ctrl_EyeLookOutRight");
+	MorphsToAdd.append("facs_ctrl_EyeLookInRight");
+	MorphsToAdd.append("facs_ctrl_EyeLookOutLeft");
+	MorphsToAdd.append("facs_ctrl_EyeLookUpLeft");
+	MorphsToAdd.append("facs_ctrl_EyeLookUpRight");
+	MorphsToAdd.append("facs_jnt_EyeWideLeft");
+	MorphsToAdd.append("facs_jnt_EyeWideRight");
+
 }
 
 // Hard coded list of morphs for Genesis 8.1 and ARKit
@@ -874,13 +1293,16 @@ void DzBridgeMorphSelectionDialog::HandleARKitGenesis81MorphsButton()
 	MorphsToAdd.append("facs_bs_NoseSneerRight_div2");
 	MorphsToAdd.append("facs_bs_TongueOut");
 
+	// add additional FACS morphs for both 8.1 and 9 to MorphsToAdd
+	addGenesis81FACS(MorphsToAdd);
+	addGenesis9FACS(MorphsToAdd);
 
 	// Add the list for export
 	foreach(QString MorphName, MorphsToAdd)
 	{
-		if (morphs.contains(MorphName) && !morphsToExport.contains(morphs[MorphName]))
+		if (m_morphInfoMap.contains(MorphName) && !m_morphsToExport.contains(m_morphInfoMap[MorphName]))
 		{
-			morphsToExport.append(morphs[MorphName]);
+			m_morphsToExport.append(m_morphInfoMap[MorphName]);
 		}
 	}
 	RefreshExportMorphList();
@@ -895,16 +1317,16 @@ void DzBridgeMorphSelectionDialog::HandleFaceFXGenesis8Button()
 	MorphsToAdd.append("eCTRLvM");
 	MorphsToAdd.append("eCTRLvF");
 	MorphsToAdd.append("eCTRLMouthOpen");
-	MorphsToAdd.append("eCTRLMouthWide-Narrow"); 
+	MorphsToAdd.append("eCTRLMouthWide-Narrow");
 	MorphsToAdd.append("eCTRLTongueIn-Out");
 	MorphsToAdd.append("eCTRLTongueUp-Down");
 
 	// Add the list for export
 	foreach(QString MorphName, MorphsToAdd)
 	{
-		if (morphs.contains(MorphName) && !morphsToExport.contains(morphs[MorphName]))
+		if (m_morphInfoMap.contains(MorphName) && !m_morphsToExport.contains(m_morphInfoMap[MorphName]))
 		{
-			morphsToExport.append(morphs[MorphName]);
+			m_morphsToExport.append(m_morphInfoMap[MorphName]);
 		}
 	}
 	RefreshExportMorphList();
@@ -915,11 +1337,16 @@ void DzBridgeMorphSelectionDialog::HandleAutoJCMCheckBoxChange(bool checked)
 	settings->setValue("AutoJCMEnabled", checked);
 }
 
+void DzBridgeMorphSelectionDialog::HandleFakeDualQuatCheckBoxChange(bool checked)
+{
+	settings->setValue("FakeDualQuatEnabled", checked);
+}
+
 // Refresh the Right export list
 void DzBridgeMorphSelectionDialog::RefreshExportMorphList()
 {
 	morphExportListWidget->clear();
-	foreach(MorphInfo morphInfo, morphsToExport)
+	foreach(MorphInfo morphInfo, m_morphsToExport)
 	{
 		SortingListItem* item = new SortingListItem();
 		item->setText(morphInfo.Label);
@@ -927,7 +1354,6 @@ void DzBridgeMorphSelectionDialog::RefreshExportMorphList()
 
 		morphExportListWidget->addItem(item);
 	}
-	SavePresetFile(NULL);
 }
 
 // Refresh the list of preset csvs from the files in the folder
@@ -939,7 +1365,7 @@ void DzBridgeMorphSelectionDialog::RefreshPresetsCombo()
 	presetCombo->addItem("None");
 
 	QDirIterator it(presetsFolder, QStringList() << "*.csv", QDir::NoFilter, QDirIterator::NoIteratorFlags);
-	while (it.hasNext()) 
+	while (it.hasNext())
 	{
 		QString Path = it.next();
 		QString NewPath = Path.right(Path.length() - presetsFolder.length() - 1);
@@ -951,7 +1377,7 @@ void DzBridgeMorphSelectionDialog::RefreshPresetsCombo()
 // Call when the preset combo is changed by the user
 void DzBridgeMorphSelectionDialog::HandlePresetChanged(const QString& presetName)
 {
-	morphsToExport.clear();
+	m_morphsToExport.clear();
 	QString PresetFilePath = presetsFolder + QDir::separator() + presetName;
 
 	QFile file(PresetFilePath);
@@ -969,45 +1395,59 @@ void DzBridgeMorphSelectionDialog::HandlePresetChanged(const QString& presetName
 		{
 			QStringList Items = MorphLine.split(",");
 			QString MorphName = Items[0].replace("\"", "");
-			if (morphs.contains(MorphName))
+			if (m_morphInfoMap.contains(MorphName))
 			{
-				morphsToExport.append(morphs[MorphName]);
+				m_morphsToExport.append(m_morphInfoMap[MorphName]);
 			}
 		}
 	}
 
 	RefreshExportMorphList();
-	GetActiveJointControlledMorphs();
 	file.close();
 }
 
-// Get the morph string (aka morphsToExport) in the format for the Daz FBX Export
+// Get the morph string (aka m_morphsToExport_finalized) in the format for the Daz FBX Export
 QString DzBridgeMorphSelectionDialog::GetMorphString()
 {
-	GetActiveJointControlledMorphs();
+	if (IsAutoJCMEnabled())
+	{
+		AddActiveJointControlledMorphs();
+	}
 
-	if (morphsToExport.length() == 0)
+	QList<JointLinkInfo> jointLinks = GetActiveJointControlledMorphs();
+
+	if (m_morphsToExport.length() == 0 && jointLinks.length() == 0)
 	{
 		return "";
 	}
 	QStringList morphNamesToExport;
-	foreach(MorphInfo exportMorph, morphsToExport)
+	foreach(MorphInfo exportMorph, m_morphsToExport_finalized)
 	{
 		morphNamesToExport.append(exportMorph.Name);
+	}
+	foreach(JointLinkInfo jointLink, jointLinks)
+	{
+		morphNamesToExport.append(jointLink.Morph);
+		morphNamesToExport.append(jointLink.Morph + "_dq2lb");
 	}
 	QString morphString = morphNamesToExport.join("\n1\n");
 	morphString += "\n1\n.CTRLVS\n2\nAnything\n0";
 	return morphString;
 }
 
-// Get the morph string (aka morphsToExport) in the format used for presets
-QString DzBridgeMorphSelectionDialog::GetMorphCSVString()
+// Get the morph string (aka m_morphsToExport_finalized) in the format used for presets
+QString DzBridgeMorphSelectionDialog::GetMorphCSVString(bool bUseFinalizedList)
 {
-	morphList.clear();
+	//morphList.clear();
 	QString morphString;
-	foreach(MorphInfo exportMorph, morphsToExport)
+	QList<MorphInfo> *pMorphList = &m_morphsToExport;
+	if (bUseFinalizedList)
 	{
-		morphList.append(exportMorph.Name);
+		pMorphList = &m_morphsToExport_finalized;
+	}
+	foreach(MorphInfo exportMorph, *pMorphList)
+	{
+		//morphList.append(exportMorph.Name);
 		morphString += "\"" + exportMorph.Name + "\",\"Export\"\n";
 	}
 	morphString += "\".CTRLVS\", \"Ignore\"\n";
@@ -1015,15 +1455,23 @@ QString DzBridgeMorphSelectionDialog::GetMorphCSVString()
 	return morphString;
 }
 
-// Get the morph string (aka morphsToExport) in an internal name = friendly name format
+// Get the morph string (aka m_morphsToExport_finalized) in an internal name = friendly name format
 // Used to rename them to the friendly name in Unreal
-QMap<QString,QString> DzBridgeMorphSelectionDialog::GetMorphRenaming()
+QMap<QString,QString> DzBridgeMorphSelectionDialog::GetMorphMapping()
 {
 	// NOTE: morphNameMapping is alternatively populated with ALL morphs by GetAvailableMorphs()
-	morphNameMapping.clear();
-	foreach(MorphInfo exportMorph, morphsToExport)
+	//morphNameMapping.clear();
+	QMap<QString, QString> morphNameMapping;
+	foreach(MorphInfo exportMorph, m_morphsToExport_finalized)
 	{
 		morphNameMapping.insert(exportMorph.Name, exportMorph.Label);
+	}
+
+	QList<JointLinkInfo> jointLinks = GetActiveJointControlledMorphs();
+	foreach(JointLinkInfo jointLink, jointLinks)
+	{
+		morphNameMapping.insert(jointLink.LinkMorphInfo.Name, jointLink.LinkMorphInfo.Label);
+		morphNameMapping.insert(jointLink.LinkMorphInfo.Name + "_dq2lb", jointLink.LinkMorphInfo.Label + "_dq2lb");
 	}
 
 	return morphNameMapping;
@@ -1033,11 +1481,11 @@ QMap<QString,QString> DzBridgeMorphSelectionDialog::GetMorphRenaming()
 // DB Dec-21-2021, Created for scripting.
 QString DzBridgeMorphSelectionDialog::GetMorphLabelFromName(QString morphName)
 {
-	if (morphs.isEmpty()) return QString();
+	if (m_morphInfoMap.isEmpty()) return QString();
 
-	if (morphs.contains(morphName))
+	if (m_morphInfoMap.contains(morphName))
 	{
-		MorphInfo morph = morphs[morphName];
+		MorphInfo morph = m_morphInfoMap[morphName];
 		return morph.Label;
 	}
 	else
@@ -1051,11 +1499,11 @@ QString DzBridgeMorphSelectionDialog::GetMorphLabelFromName(QString morphName)
 // DB June-01-2022, Created for MorphLinks Generation for Blender Bridge Morphs Support
 MorphInfo DzBridgeMorphSelectionDialog::GetMorphInfoFromName(QString morphName)
 {
-	if (morphs.isEmpty()) return MorphInfo();
+	if (m_morphInfoMap.isEmpty()) return MorphInfo();
 
-	if (morphs.contains(morphName))
+	if (m_morphInfoMap.contains(morphName))
 	{
-		MorphInfo morph = morphs[morphName];
+		MorphInfo morph = m_morphInfoMap[morphName];
 		return morph;
 	}
 	else
@@ -1069,7 +1517,7 @@ QString DzBridgeMorphSelectionDialog::getMorphPropertyName(DzProperty* pMorphPro
 {
 	if (pMorphProperty == nullptr)
 	{
-		// issue error message or alternatively: throw exception 
+		// issue error message or alternatively: throw exception
 		printf("ERROR: DazBridge: DzBridgeMorphSelectionDialog.cpp, getPropertyName(): nullptr passed as argument.");
 		return "";
 	}
@@ -1086,7 +1534,7 @@ bool DzBridgeMorphSelectionDialog::isValidMorph(DzProperty* pMorphProperty)
 {
 	if (pMorphProperty == nullptr)
 	{
-		// issue error message or alternatively: throw exception 
+		// issue error message or alternatively: throw exception
 		printf("ERROR: DazBridge: DzBridgeMorphSelectionDialog.cpp, isValidMorph(): nullptr passed as argument.");
 		return false;
 	}
@@ -1117,13 +1565,22 @@ bool DzBridgeMorphSelectionDialog::isValidMorph(DzProperty* pMorphProperty)
 void DzBridgeMorphSelectionDialog::HandleAddConnectedMorphs()
 {
 	// sanity check
-	if (morphsToExport.length() == 0)
+	if (m_morphsToExport.length() == 0)
 	{
 		return;
 	}
-	foreach (MorphInfo exportMorph, morphsToExport)
+
+	QList<JointLinkInfo> jointLinks = GetActiveJointControlledMorphs();
+
+	/////////////////////////////////////////////////////////////////////////////////////
+	// foreach (MorphInfo exportMorph, m_morphsToExport)
+	// {
+	// 	DzProperty *morphProperty = exportMorph.Property;
+	/////////////////////////////////////////////////////////////////////////////////////
+	foreach (JointLinkInfo jointLink, jointLinks)
 	{
-		DzProperty *morphProperty = exportMorph.Property;
+		DzProperty *morphProperty = jointLink.LinkMorphInfo.Property;
+	/////////////////////////////////////////////////////////////////////////////////////
 		if (morphProperty == nullptr)
 		{
 			// log unexpected error
@@ -1137,38 +1594,47 @@ void DzBridgeMorphSelectionDialog::HandleAddConnectedMorphs()
 			QString sMorphName = getMorphPropertyName(controllerProperty);
 
 			// Add the list for export
-			if (morphs.contains(sMorphName) && !morphsToExport.contains(morphs[sMorphName]))
+			if (m_morphInfoMap.contains(sMorphName) && !m_morphsToExport.contains(m_morphInfoMap[sMorphName]))
 			{
-				morphsToExport.append(morphs[sMorphName]);
+				m_morphsToExport.append(m_morphInfoMap[sMorphName]);
 			}
 
 		}
 	}
 	RefreshExportMorphList();
 }
-// Disable Morph if the morph has a controller that is also being exported
+
+// Return list of Morphs to disable if the morph has a controller that is also being exported
 QList<QString> DzBridgeMorphSelectionDialog::getMorphNamesToDisconnectList()
 {
 	QList<QString> morphsToDisconnect;
 
-	foreach (MorphInfo exportMorph, morphsToExport)
+	// DB 2023-July-10, Allow Morph Double-Dipping
+	if (this->allowMorphDoubleDippingCheckBox->isChecked() == false)
 	{
-		DzProperty* morphProperty = exportMorph.Property;
-		// DB, 2022-June-07: NOTE: using iterator may be more efficient due to potentially large number of controllers
-		for (auto iterator = morphProperty->controllerListIterator(); iterator.hasNext(); )
+		foreach (MorphInfo exportMorph, m_morphsToExport_finalized)
 		{
-			DzERCLink* ercLink = qobject_cast<DzERCLink*>(iterator.next());
-			if (ercLink == nullptr)
+			DzProperty* morphProperty = exportMorph.Property;
+			// DB (2022-Sept-26): crashfix
+			if (morphProperty == nullptr)
 				continue;
-			auto controllerProperty = ercLink->getProperty();
-			QString sControllerName = getMorphPropertyName(controllerProperty);
-			// iterate through each exported morph
-			foreach (MorphInfo compareMorph, morphsToExport)
+
+			// DB, 2022-June-07: NOTE: using iterator may be more efficient due to potentially large number of controllers
+			for (auto iterator = morphProperty->controllerListIterator(); iterator.hasNext(); )
 			{
-				if (compareMorph.Name == sControllerName)
+				DzERCLink* ercLink = qobject_cast<DzERCLink*>(iterator.next());
+				if (ercLink == nullptr)
+					continue;
+				auto controllerProperty = ercLink->getProperty();
+				QString sControllerName = getMorphPropertyName(controllerProperty);
+				// iterate through each exported morph
+				foreach (MorphInfo compareMorph, m_morphsToExport_finalized)
 				{
-					morphsToDisconnect.append(exportMorph.Name);
-					break;
+					if (compareMorph.Name == sControllerName)
+					{
+						morphsToDisconnect.append(exportMorph.Name);
+						break;
+					}
 				}
 			}
 		}
@@ -1177,11 +1643,64 @@ QList<QString> DzBridgeMorphSelectionDialog::getMorphNamesToDisconnectList()
 	return morphsToDisconnect;
 }
 
+QList<QString> DzBridgeMorphSelectionDialog::GetPoseList()
+{
+	QList<QString> poseList;
+	foreach(MorphInfo exportMorph, m_morphsToExport)
+	{
+		poseList.append(exportMorph.Name);
+	}
+	return poseList;
+}
+
 void DzBridgeMorphSelectionDialog::SetAutoJCMVisible(bool bVisible)
 {
 	if (autoJCMCheckBox==nullptr)
 		return;
 	autoJCMCheckBox->setVisible(bVisible);
+	fakeDualQuatCheckBox->setVisible(bVisible);
+	addConnectedMorphsButton->setVisible(bVisible);
+	update();
+}
+
+void DzBridgeMorphSelectionDialog::HandleDialogAccepted(bool bSavePreset)
+{
+	// Commit GUI right pane listbox to m_morphsToExport
+	m_morphsToExport_finalized.clear();
+	for (auto morph : m_morphsToExport)
+	{
+		m_morphsToExport_finalized.append(morph);
+	}
+
+	if (bSavePreset)
+	{
+		SavePresetFile(NULL);
+	}
+
+	return;
+}
+
+void DzBridgeMorphSelectionDialog::SetAutoJCMEnabled(bool bEnabled)
+{
+	if (autoJCMCheckBox == nullptr)
+		return;
+	autoJCMCheckBox->setChecked(bEnabled);
+	update();
+}
+
+void DzBridgeMorphSelectionDialog::SetAllowMorphDoubleDippingEnabled(bool bEnabled)
+{
+	if (allowMorphDoubleDippingCheckBox == nullptr)
+		return;
+	allowMorphDoubleDippingCheckBox->setChecked(bEnabled);
+	update();
+}
+
+void DzBridgeMorphSelectionDialog::SetAllowMorphDoubleDippingVisible(bool bVisible)
+{
+	if (allowMorphDoubleDippingCheckBox == nullptr)
+		return;
+	allowMorphDoubleDippingCheckBox->setVisible(bVisible);
 	update();
 }
 

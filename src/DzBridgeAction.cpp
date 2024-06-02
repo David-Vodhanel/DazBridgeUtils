@@ -31,6 +31,7 @@
 #include <dzprogress.h>
 #include <dztexture.h>
 #include <dzimagemgr.h>
+#include <dzscript.h>
 
 #include "dzgeometry.h"
 #include "dzweightmap.h"
@@ -61,6 +62,15 @@
 #include "DzBridgeSubdivisionDialog.h"
 #include "DzBridgeMorphSelectionDialog.h"
 
+#include <qimage.h>
+#include "ImageTools.h"
+
+// miniz-lib
+extern "C"
+{
+	unsigned long mz_crc32(unsigned long crc, const unsigned char* ptr, size_t buf_len);
+}
+
 using namespace DzBridgeNameSpace;
 
 /// <summary>
@@ -82,6 +92,14 @@ DzBridgeAction::DzBridgeAction(const QString& text, const QString& desc) :
 	 m_bUndoNormalMaps = true;
 #endif
 
+	 m_bPostProcessFbx = true;
+	 m_bRemoveDuplicateGeografts = true;
+	 m_bExperimental_FbxPostProcessing = false;
+
+	 // LOD settings
+	 m_bEnableLodGeneration = false;
+	 m_bCreateLodGroup = false;
+
 }
 
 DzBridgeAction::~DzBridgeAction()
@@ -97,6 +115,8 @@ void DzBridgeAction::resetToDefaults()
 	m_EnableSubdivisions = false;
 	m_bShowFbxOptions = false;
 	m_bExportMaterialPropertiesCSV = false;
+	m_bEnableLodGeneration = false;
+	m_bCreateLodGroup = false;
 	resetArray_ControllersToDisconnect();
 
 	// Reset all dialog settings and script-exposed properties to Hardcoded Defaults
@@ -188,6 +208,7 @@ bool DzBridgeAction::preProcessScene(DzNode* parentNode)
 	QList<QString> existingMaterialNameList;
 	for (int i = 0; i < nodeJobList.length(); i++)
 	{
+		preProcessProgress.step();
 		DzNode *node = nodeJobList[i];
 		DzObject* object = node->getObject();
 		DzShape* shape = object ? object->getCurrentShape() : NULL;
@@ -201,6 +222,7 @@ bool DzBridgeAction::preProcessScene(DzNode* parentNode)
 					//////////////////
 					// Rename Duplicate Material
 					/////////////////
+					preProcessProgress.setInfo("Renaming Duplicate Materials: " + material->getLabel());
 					renameDuplicateMaterial(material, &existingMaterialNameList);
 
 					//////////////////
@@ -208,6 +230,7 @@ bool DzBridgeAction::preProcessScene(DzNode* parentNode)
 					/////////////////
 					if (m_sAssetType == "SkeletalMesh")
 					{
+						preProcessProgress.setInfo("Renaming Duplicate Clothing...");
 						renameDuplicateClothing();
 					}
 
@@ -215,12 +238,47 @@ bool DzBridgeAction::preProcessScene(DzNode* parentNode)
 					// Generate Missing Normal Maps
 					/////////////////
 					if (m_bGenerateNormalMaps)
+					{
+						preProcessProgress.setInfo("Generating Missing Normal Maps: " + material->getLabel());
 						generateMissingNormalMap(material);
+					}
+
+					///////////////////
+					// Multiply Texture Values
+					// This should be performed before Combine Diffuse + Alpha so that the correctly modulated alpha map is added to diffuse
+					//////////////////
+					if (m_bMultiplyTextureValues)
+					{
+						preProcessProgress.setInfo("Multiplying Texture Values: " + material->getLabel());
+						multiplyTextureValues(material);
+					}
+
+					////////////////////
+					// Combine Diffuse and Alpha Maps
+					////////////////////
+					if (m_bCombineDiffuseAndAlphaMaps)
+					{
+						preProcessProgress.setInfo("Combining Diffuse and Alpha Maps: " + material->getLabel());
+						combineDiffuseAndAlphaMaps(material);
+					}
 				}
 			}
+
+			// Look for geografts, add to geograft list
+			if (isGeograft(node))
+			{
+				m_aGeografts.append(node->getName());
+				//QString shapeName = shape->getName();
+				//if (shapeName != "" && shapeName != node->getName())
+				//{
+				//	m_aGeografts.append(shapeName);
+				//}
+			}
+
 		}
 	}
 
+    preProcessProgress.setInfo("DazBridge: Pre-Processing Completed.");
 	preProcessProgress.finish();
 
 	return true;
@@ -353,6 +411,8 @@ bool DzBridgeAction::generateMissingNormalMap(DzMaterial* material)
 /// <returns>true if the undo process completed successfully.</returns>
 bool DzBridgeAction::undoGenerateMissingNormalMaps()
 {
+    DzProgress::setCurrentInfo("Daz Bridge: Undoing Missing Normal Map Generation...");
+
 	QMap<DzMaterial*, DzProperty*>::iterator iter;
 	for (iter = m_undoTable_GenerateMissingNormalMap.begin(); iter != m_undoTable_GenerateMissingNormalMap.end(); ++iter)
 	{
@@ -370,6 +430,8 @@ bool DzBridgeAction::undoGenerateMissingNormalMaps()
 		}
 	}
 	m_undoTable_GenerateMissingNormalMap.clear();
+
+    DzProgress::setCurrentInfo("Daz Bridge: Undo Missing Normal Map Generation Complete.");
 
 	return true;
 }
@@ -554,6 +616,8 @@ bool DzBridgeAction::isHeightMapPresent(DzMaterial* material)
 /// <returns>true if all undo procedures are successful</returns>
 bool DzBridgeAction::undoPreProcessScene()
 {
+    DzProgress::setCurrentInfo("Daz Bridge: Undoing Export Processing...");
+    
 	bool bResult = true;
 
 	if (undoRenameDuplicateMaterials() == false)
@@ -567,7 +631,15 @@ bool DzBridgeAction::undoPreProcessScene()
 		bResult = false;
 	}
 
-	return bResult;
+	// Undo Combine Diffuse and ALpha Maps
+	if (undoCombineDiffuseAndAlphaMaps() == false)
+	{
+		bResult = false;
+	}
+
+    DzProgress::setCurrentInfo("Daz Bridge: Undo Export Processing Complete.");
+
+    return bResult;
 }
 
 /// <summary>
@@ -604,15 +676,18 @@ bool DzBridgeAction::renameDuplicateMaterial(DzMaterial *material, QList<QString
 /// <returns>true if successful</returns>
 bool DzBridgeAction::undoRenameDuplicateMaterials()
 {
-	QMap<DzMaterial*, QString>::iterator iter;
+    DzProgress::setCurrentInfo("Daz Bridge: Undoing Duplicate Material Renaming...");
+
+    QMap<DzMaterial*, QString>::iterator iter;
 	for (iter = m_undoTable_DuplicateMaterialRename.begin(); iter != m_undoTable_DuplicateMaterialRename.end(); ++iter)
 	{
 		iter.key()->setName(iter.value());
 	}
 	m_undoTable_DuplicateMaterialRename.clear();
 
-	return true;
+    DzProgress::setCurrentInfo("Daz Bridge: Undo Duplicate Material Renaming Complete.");
 
+    return true;
 }
 
 /// <summary>
@@ -620,7 +695,7 @@ bool DzBridgeAction::undoRenameDuplicateMaterials()
 /// prevent collisions in Target Software. Called by preProcessScene().
 /// See also: undoRenameDuplicateClothing().
 /// </summary>
-/// <returns>true if successful</returns> 
+/// <returns>true if successful</returns>
 bool DzBridgeAction::renameDuplicateClothing()
 {
 	// first get the figures.  We only need to check these
@@ -643,7 +718,7 @@ bool DzBridgeAction::renameDuplicateClothing()
 	}
 
 	int figureCount = figureNodes.length();
-	qDebug() << "Count: " << figureCount;
+	//qDebug() << "Count: " << figureCount;
 	for (int i = 0; i < figureCount; i++)
 	{
 		DzFigure* primaryFigure = figureNodes[i];
@@ -652,7 +727,7 @@ bool DzBridgeAction::renameDuplicateClothing()
 			DzFigure* secondaryFigure = figureNodes[j];
 			if (primaryFigure->getName() == secondaryFigure->getName())
 			{
-				qDebug() << "Match:" << primaryFigure->getName();
+				//qDebug() << "Match:" << primaryFigure->getName();
 				m_undoTable_DuplicateClothingRename.insert(secondaryFigure, secondaryFigure->getName());
 				QString newClothingName = secondaryFigure->getName() + QString("_%1").arg(j);
 				secondaryFigure->setName(newClothingName);
@@ -686,8 +761,13 @@ bool DzBridgeAction::undoRenameDuplicateClothing()
 /// <param name="exportProgress">if null, exportHD will handle UI progress updates</param>
 void DzBridgeAction::exportHD(DzProgress* exportProgress)
 {
-	if (m_subdivisionDialog == nullptr)
+    DzProgress::setCurrentInfo("Preparing asset for export via Daz Bridge Library...");
+
+    if (m_subdivisionDialog == nullptr)
 		return;
+
+	// Update the dialog so subdivision locks later find all the meshes
+	m_subdivisionDialog->PrepareDialog();
 
 	bool bLocalDzProgress = false;
 	if (!exportProgress)
@@ -701,13 +781,16 @@ void DzBridgeAction::exportHD(DzProgress* exportProgress)
 	}
 
 	// look for geograft morphs for export, and prepare
-	checkForGeograftMorphsToExport(dzScene->getPrimarySelection(), true);
+	if (m_bEnableMorphs)
+	{
+		prepareGeograftMorphsToExport(dzScene->getPrimarySelection(), true);
+	}
 
-	if (m_EnableSubdivisions)
+	if (m_EnableSubdivisions && m_sAssetType != "MLDeformer")
 	{
 		if (exportProgress)
 		{
-			exportProgress->setInfo(tr("Exporting Base Mesh..."));
+			exportProgress->setInfo(tr("Exporting Asset as Base Mesh..."));
 			exportProgress->step();
 			QCoreApplication::processEvents(QEventLoop::AllEvents, 100);
 		}
@@ -728,36 +811,37 @@ void DzBridgeAction::exportHD(DzProgress* exportProgress)
 	{
 		exportProgress->step();
 		if (m_EnableSubdivisions)
-			exportProgress->setInfo(tr("Exporting HD Mesh..."));
+			exportProgress->setInfo(tr("Exporting Asset as HD Mesh..."));
 		else
-			exportProgress->setInfo(tr("Exporting Mesh..."));
+			exportProgress->setInfo(tr("Exporting Asset..."));
 		QCoreApplication::processEvents(QEventLoop::AllEvents, 100);
 	}
 	m_subdivisionDialog->LockSubdivisionProperties(m_EnableSubdivisions);
 	m_bExportingBaseMesh = false;
+
 	exportAsset();
 	if (exportProgress)
 	{
 		exportProgress->step();
-		exportProgress->setInfo(tr("Mesh exported."));
+		exportProgress->setInfo(tr("Exporting Asset: Completed."));
 	}
 
 	// Export any geograft morphs if exist
 	if (m_bEnableMorphs)
 	{
-		if (exportGeograftMorphs(dzScene->getPrimarySelection(), m_sDestinationPath))
+        if (exportGeograftMorphs(dzScene->getPrimarySelection(), m_sDestinationPath))
 		{
 			exportProgress->step();
 			exportProgress->setInfo(tr("Geograft morphs exported."));
 		}
 	}
 
-	if (m_EnableSubdivisions)
+	if (m_EnableSubdivisions && m_sAssetType != "MLDeformer")
 	{
 		if (exportProgress)
 		{
 			exportProgress->step();
-			exportProgress->setInfo(tr("Fixing weightmaps on HD Mesh..."));
+			exportProgress->setInfo(tr("Fixing bone weightmaps on HD Mesh..."));
 			QCoreApplication::processEvents(QEventLoop::AllEvents, 100);
 		}
 
@@ -766,7 +850,7 @@ void DzBridgeAction::exportHD(DzProgress* exportProgress)
 		QString BaseCharacterFBX = this->m_sDestinationFBX;
 		BaseCharacterFBX.replace(".fbx", "_base.fbx");
 		// DB 2021-10-02: Upgrade HD
-		if (upgradeToHD(BaseCharacterFBX, m_sDestinationFBX, m_sDestinationFBX, pLookupTable) == false)
+        if (upgradeToHD(BaseCharacterFBX, m_sDestinationFBX, m_sDestinationFBX, pLookupTable) == false)
 		{
 			if (m_nNonInteractiveMode == 0) QMessageBox::warning(0, tr("Error"),
 				tr("There was an error during the Subdivision Surface refinement operation, the exported Daz model may not work correctly."), QMessageBox::Ok);
@@ -870,7 +954,8 @@ void DzBridgeAction::exportAsset()
 			Node->setWSTransform(DzVec3(0.0f, 0.0f, 0.0f), DzQuat(), DzMatrix3(true));
 
 			// Export
-			exportNode(Node);
+            DzProgress::setCurrentInfo("Environment Export: Exporting Node: " + Node->getLabel());
+            exportNode(Node);
 
 			// Put the item back where it was
 			Node->setWSTransform(Location, Rotation, Scale);
@@ -914,7 +999,7 @@ void DzBridgeAction::exportAsset()
 			if (numericProperty)
 			{
 				QString propName = property->getName();
-				if (m_mMorphNameToLabel.contains(propName))
+				if (m_aPoseExportList.contains(propName))
 				{
 					poseIndex++;
 					numericProperty->setDoubleValue(0.0f, 0.0f);
@@ -947,11 +1032,11 @@ void DzBridgeAction::exportAsset()
 						{
 							QString propName = property->getName();
 							//qDebug() << propName;
-							if (m_mMorphNameToLabel.contains(modifier->getName()))
+							if (m_aPoseExportList.contains(modifier->getName()))
 							{
 								poseIndex++;
 								numericProperty->setDoubleValue(0.0f, 0.0f);
-								for (int frame = 0; frame < m_mMorphNameToLabel.count() + 1; frame++)
+								for (int frame = 0; frame < m_aPoseExportList.count() + 1; frame++)
 								{
 									numericProperty->setDoubleValue(dzScene->getTimeStep() * double(frame), 0.0f);
 								}
@@ -969,6 +1054,7 @@ void DzBridgeAction::exportAsset()
 		dzScene->setAnimRange(DzTimeRange(0, poseIndex * dzScene->getTimeStep()));
 		dzScene->setPlayRange(DzTimeRange(0, poseIndex * dzScene->getTimeStep()));
 
+        DzProgress::setCurrentInfo("Pose Export: Exporting Selection: " + Selection->getLabel());
 		exportNode(Selection);
 	}
 	else if (m_sAssetType == "SkeletalMesh")
@@ -976,10 +1062,16 @@ void DzBridgeAction::exportAsset()
 		QList<QString> DisconnectedModifiers;
 		if (m_bEnableMorphs)
 		{
+			if (m_morphSelectionDialog->IsAutoJCMEnabled() && m_morphSelectionDialog->IsFakeDualQuatEnabled())
+			{
+				exportJCMDualQuatDiff();
+			}
+            DzProgress::setCurrentInfo("SkeletalMesh Export: Disconnecting Override Controllers... ");
 			DisconnectedModifiers = disconnectOverrideControllers();
 		}
 		DzNode* Selection = dzScene->getPrimarySelection();
-		exportNode(Selection);
+        DzProgress::setCurrentInfo("SkeletalMesh Export: Exporting Selection: " + Selection->getLabel());
+        exportNode(Selection);
 		if (m_bEnableMorphs)
 		{
 			reconnectOverrideControllers(DisconnectedModifiers);
@@ -988,6 +1080,7 @@ void DzBridgeAction::exportAsset()
 	else
 	{
 		DzNode* Selection = dzScene->getPrimarySelection();
+        DzProgress::setCurrentInfo("SkeletalMesh Export: Exporting Selection: " + Selection->getLabel());
 		exportNode(Selection);
 	}
 }
@@ -1060,11 +1153,11 @@ void DzBridgeAction::exportNode(DzNode* Node)
 		 return;
 	 }
 
-	 if (m_sAssetType == "Animation" && m_bAnimationUseExperimentalTransfer)
+	 if ((m_sAssetType == "Animation" || m_sAssetType == "Pose") && m_bAnimationUseExperimentalTransfer)
 	 {
 		 QDir dir;
 		 dir.mkpath(m_sDestinationPath);
-		 exportAnimation();
+		 exportAnimation(/*bExportingForMLDeformer*/);
 		 writeConfiguration();
 		 return;
 	 }
@@ -1118,7 +1211,8 @@ void DzBridgeAction::exportNode(DzNode* Node)
 		  ExportOptions.setBoolValue("doStaticClothing", false);
 		  ExportOptions.setBoolValue("degradedSkinning", true);
 		  ExportOptions.setBoolValue("degradedScaling", true);
-		  ExportOptions.setBoolValue("doSubD", false);
+		  // DB 5-26-2023: enable doSubD to export crease-info
+		  ExportOptions.setBoolValue("doSubD", true);
 		  ExportOptions.setBoolValue("doCollapseUVTiles", false);
 
 		  if (m_sAssetType == "SkeletalMesh" && m_EnableSubdivisions)
@@ -1169,6 +1263,10 @@ void DzBridgeAction::exportNode(DzNode* Node)
 */
 
 		  preProcessScene(Parent);
+		  if (m_bMorphLockBoneTranslation)
+		  {
+			  lockBoneControls(Parent);
+		  }
 
 		  QDir dir;
 		  dir.mkpath(m_sDestinationPath);
@@ -1186,9 +1284,16 @@ void DzBridgeAction::exportNode(DzNode* Node)
 		  else
 		  {
 			  Exporter->writeFile(m_sDestinationFBX, &ExportOptions);
+
+			  // DB 2022-09-26: Post-Process FBX file
+			  postProcessFbx(m_sDestinationFBX);
+
 			  writeConfiguration();
 		  }
-
+		  if (m_bMorphLockBoneTranslation)
+		  {
+			  unlockBoneControl(Parent);
+		  }
 		  undoPreProcessScene();
 	 }
 }
@@ -1209,13 +1314,20 @@ void DzBridgeAction::exportAnimation()
 	SdkManager->SetIOSettings(ios);
 
 	int FileFormat = -1;
-	FileFormat = SdkManager->GetIOPluginRegistry()->FindWriterIDByDescription("FBX ascii (*.fbx)");
-	qDebug() << "FileName: " << this->m_sDestinationFBX;
+#ifdef VODSVERSION
+    FileFormat = SdkManager->GetIOPluginRegistry()->FindWriterIDByDescription("FBX ascii (*.fbx)");
+#else
+    FileFormat = SdkManager->GetIOPluginRegistry()->GetNativeWriterFormat();
+#endif
+    //qDebug() << "FileName: " << this->m_sDestinationFBX;
 	FbxExporter* Exporter = FbxExporter::Create(SdkManager, "");
 	if (!Exporter->Initialize(this->m_sDestinationFBX.toLocal8Bit().data(), FileFormat, SdkManager->GetIOSettings()))
 	{
 		return;
 	}
+
+	// Get the Figure Scale
+	float FigureScale = m_pSelectedNode->getScaleControl()->getValue();
 
 	// Create the Scene
 	FbxScene* Scene = FbxScene::Create(SdkManager, "");
@@ -1232,14 +1344,14 @@ void DzBridgeAction::exportAnimation()
 	DzTimeRange PlayRange = dzScene->getPlayRange();
 
 	//
-	//exportNodeAnimation(Figure, BoneMap, AnimBaseLayer);
+	exportNodeAnimation(Figure, BoneMap, AnimBaseLayer, FigureScale /*, bExportingForMLDeformer*/);
 
 	// Iterate the bones
 	DzBoneList Bones;
 	Skeleton->getAllBones(Bones);
 	for (auto Bone : Bones)
 	{
-		exportNodeAnimation(Bone, BoneMap, AnimBaseLayer);
+		exportNodeAnimation(Bone, BoneMap, AnimBaseLayer, FigureScale /*, bExportingForMLDeformer*/);
 	}
 
 	// Get a list of animated properties
@@ -1254,7 +1366,7 @@ void DzBridgeAction::exportAnimation()
 	Exporter->Destroy();
 }
 
-void DzBridgeAction::exportNodeAnimation(DzNode* Bone, QMap<DzNode*, FbxNode*>& BoneMap, FbxAnimLayer* AnimBaseLayer)
+void DzBridgeAction::exportNodeAnimation(DzNode* Bone, QMap<DzNode*, FbxNode*>& BoneMap, FbxAnimLayer* AnimBaseLayer, float FigureScale)
 {
 	DzTimeRange PlayRange = dzScene->getPlayRange();
 
@@ -1278,13 +1390,13 @@ void DzBridgeAction::exportNodeAnimation(DzNode* Bone, QMap<DzNode*, FbxNode*>& 
 		DefaultPosition.m_z = Bone->getOriginZControl()->getValue(CurrentTime);
 		DzMatrix3 Scale = Bone->getWSScale();
 		//qDebug() << Bone->getName() << " Scale: " << Scale.row(0).length() << "," << Scale.row(1).length() << "," << Scale.row(2).length();
-		
-		//qDebug() << Bone->getName() << " Default Position: " << DefaultPosition.m_x << "," << DefaultPosition.m_y << "," << DefaultPosition.m_z;
+
+		qDebug() << Bone->getName() << " Default Position: " << DefaultPosition.m_x << "," << DefaultPosition.m_y << "," << DefaultPosition.m_z;
 		DzVec3 Position;
 		Position.m_x = Bone->getXPosControl()->getValue(CurrentTime);
 		Position.m_y = Bone->getYPosControl()->getValue(CurrentTime);
 		Position.m_z = Bone->getZPosControl()->getValue(CurrentTime);
-		//qDebug() << Bone->getName() << " Position: " << Position.m_x << "," << Position.m_y << "," << Position.m_z;
+		qDebug() << Bone->getName() << " Position: " << Position.m_x << "," << Position.m_y << "," << Position.m_z;
 
 		// Get an initial rotation via the controls
 		DzVec3 ControlRotation;
@@ -1293,13 +1405,30 @@ void DzBridgeAction::exportNodeAnimation(DzNode* Bone, QMap<DzNode*, FbxNode*>& 
 		ControlRotation.m_z = Bone->getZRotControl()->getValue(CurrentTime);
 		DzVec3 VectorRotation = ControlRotation;
 
+		// Scale
+		DzVec3 ControlScale(1.0f, 1.0f, 1.0f);
+		//float FigureScale = 1.0f;
+		if (m_bAnimationApplyBoneScale)
+		{
+			//DzSkeleton* Skeleton = m_pSelectedNode->getSkeleton();
+			//DzFigure* Figure = Skeleton ? qobject_cast<DzFigure*>(Skeleton) : NULL;
+			FigureScale = Bone->getScaleControl()->getValue(CurrentTime);
+
+			ControlScale.m_x = Bone->getXScaleControl()->getValue(CurrentTime) * FigureScale;
+			ControlScale.m_y = Bone->getYScaleControl()->getValue(CurrentTime) * FigureScale;
+			ControlScale.m_z = Bone->getZScaleControl()->getValue(CurrentTime) * FigureScale;
+
+			//DzMatrix3 Scale = Bone->getLocalScale(CurrentTime);
+			//qDebug() << Bone->getName() << " Scale: " << ControlScale.m_x << "," << ControlScale.m_y << "," << ControlScale.m_z;
+		}
+
 		// Get the rotation and position relative to the parent
 		if (DzNode* ParentBone = Bone->getNodeParent())
 		{
 
 			// Get the local orientation
 			DzQuat Orientation = Bone->getOrientation(true) * ParentBone->getOrientation(true).inverse();
-			
+
 			// Fix the rotation order
 			VectorRotation = ControlRotation;
 			DzQuat ReorderQuat;
@@ -1331,14 +1460,35 @@ void DzBridgeAction::exportNodeAnimation(DzNode* Bone, QMap<DzNode*, FbxNode*>& 
 			//qDebug() << Bone->getName() << " Parent Default Position: " << DefaultParentPosition.m_x << "," << DefaultParentPosition.m_y << "," << DefaultParentPosition.m_z;
 
 			DzVec3 RelativeDefaultPosition = DefaultPosition - DefaultParentPosition;
-			float Length = RelativeDefaultPosition.length();
+			//float Length = RelativeDefaultPosition.length();
 			DzVec3 OrientedRelativeDefaultPosition = ParentBone->getOrientation(true).inverse().multVec(RelativeDefaultPosition);
 
-			//qDebug() << Bone->getName() << " RelativeDefaultPosition: " << NewRelativeDefaultPosition.m_x << "," << NewRelativeDefaultPosition.m_y << "," << NewRelativeDefaultPosition.m_z;
+			//qDebug() << Bone->getName() << " RelativeDefaultPosition: " << OrientedRelativeDefaultPosition.m_x << "," << OrientedRelativeDefaultPosition.m_y << "," << OrientedRelativeDefaultPosition.m_z;
 			DzVec3 RelativeMovement = Position - ParentPosition;
 			//qDebug() << Bone->getName() << " RelativeMovement: " << RelativeMovement.m_x << "," << RelativeMovement.m_y << "," << RelativeMovement.m_z;
-			Position = OrientedRelativeDefaultPosition + RelativeMovement;
+			qDebug() << Bone->getName() << " Position: " << Position.m_x << "," << Position.m_y << "," << Position.m_z;
+			if (ParentBone->isRootNode())
+			{
+				Position = (Position + OrientedRelativeDefaultPosition) * FigureScale;
+			}
+			else
+			{
+				Position = OrientedRelativeDefaultPosition + RelativeMovement;
+			}
+			qDebug() << Bone->getName() << " Position: " << Position.m_x << "," << Position.m_y << "," << Position.m_z;
+			//Position = Position * FigureScale;
+			/*Position.m_x = Position.m_x * ControlScale.m_x;
+			Position.m_y = Position.m_y * ControlScale.m_y;
+			Position.m_z = Position.m_z * ControlScale.m_z;*/
+			//Position = Position * ControlScale;
+
+			if (ParentBone->getName() == "head")
+			{
+				ControlScale = ControlScale * FigureScale;
+			}
 		}
+
+
 
 		// Set the frame
 		FbxTime Time;
@@ -1386,6 +1536,27 @@ void DzBridgeAction::exportNodeAnimation(DzNode* Bone, QMap<DzNode*, FbxNode*>& 
 		KeyIndex = PosZCurve->KeyAdd(Time);
 		PosZCurve->KeySet(KeyIndex, Time, Position.m_z);
 		PosZCurve->KeyModifyEnd();
+
+		// Write X Pos
+		FbxAnimCurve* ScaleXCurve = Node->LclScaling.GetCurve(AnimBaseLayer, "X", true);
+		ScaleXCurve->KeyModifyBegin();
+		KeyIndex = ScaleXCurve->KeyAdd(Time);
+		ScaleXCurve->KeySet(KeyIndex, Time, ControlScale.m_x);
+		ScaleXCurve->KeyModifyEnd();
+
+		// Write Y Pos
+		FbxAnimCurve* ScaleYCurve = Node->LclScaling.GetCurve(AnimBaseLayer, "Y", true);
+		ScaleYCurve->KeyModifyBegin();
+		KeyIndex = ScaleYCurve->KeyAdd(Time);
+		ScaleYCurve->KeySet(KeyIndex, Time, ControlScale.m_y);
+		ScaleYCurve->KeyModifyEnd();
+
+		// Write Z Pos
+		FbxAnimCurve* ScaleZCurve = Node->LclScaling.GetCurve(AnimBaseLayer, "Z", true);
+		ScaleZCurve->KeyModifyBegin();
+		KeyIndex = ScaleZCurve->KeyAdd(Time);
+		ScaleZCurve->KeySet(KeyIndex, Time, ControlScale.m_z);
+		ScaleZCurve->KeyModifyEnd();
 	}
 }
 
@@ -1480,7 +1651,7 @@ QList<DzNumericProperty*> DzBridgeAction::getAnimatedProperties(DzNode* Node)
 				{
 					animatedPropertyList.append(numericProp);
 					QString propName = property->getLabel();
-					qDebug() << "Animated Property: " << propName;
+					//qDebug() << "Animated Property: " << propName;
 				}
 			}
 		}
@@ -1508,7 +1679,7 @@ QList<DzNumericProperty*> DzBridgeAction::getAnimatedProperties(DzNode* Node)
 							{
 								animatedPropertyList.append(numericProp);
 								QString propName = property->getLabel();
-								qDebug() << "Animated Property: " << propName;
+								//qDebug() << "Animated Property: " << propName;
 							}
 						}
 					}
@@ -1530,14 +1701,14 @@ void DzBridgeAction::exportAnimatedProperties(QList<DzNumericProperty*>& Propert
 		FbxProperty fbxProperty = FbxProperty::Create(RootNode, FbxDoubleDT, numericProperty->getLabel().toLocal8Bit().data());
 		if (fbxProperty.IsValid())
 		{
-			FbxAnimCurveNode* CurveNode = fbxProperty.CreateCurveNode(AnimBaseLayer);			
+			FbxAnimCurveNode* CurveNode = fbxProperty.CreateCurveNode(AnimBaseLayer);
 			fbxProperty.ModifyFlag(FbxPropertyFlags::eAnimatable, true);
 			fbxProperty.ModifyFlag(FbxPropertyFlags::eUserDefined, true);
 			FbxAnimCurve* lAnimCurve = fbxProperty.GetCurve(AnimBaseLayer, true);
 
 			if (lAnimCurve == nullptr)
 			{
-				qDebug() << "Animated Property: FbxAnimCurve is invalid: " << numericProperty->getLabel();
+				//qDebug() << "Animated Property: FbxAnimCurve is invalid: " << numericProperty->getLabel();
 				continue;
 			}
 			lAnimCurve->KeyModifyBegin();
@@ -1559,6 +1730,268 @@ void DzBridgeAction::exportAnimatedProperties(QList<DzNumericProperty*>& Propert
 
 			lAnimCurve->KeyModifyEnd();
 		}
+	}
+}
+
+void DzBridgeAction::exportJCMDualQuatDiff()
+{
+	if (!m_pSelectedNode) return;
+
+	// Set the resolution level to Base
+	int ResolutionLevel = 1; // High Resolution
+	DzEnumProperty* ResolutionLevelProperty = NULL;
+	if (m_pSelectedNode->getObject() && m_pSelectedNode->getObject()->getCurrentShape())
+	{
+		DzShape* Shape = m_pSelectedNode->getObject()->getCurrentShape();
+		if (DzProperty* Property = Shape->findProperty("lodlevel"))
+		{
+			if (ResolutionLevelProperty = qobject_cast<DzEnumProperty*>(Property))
+			{
+				ResolutionLevel = ResolutionLevelProperty->getValue();
+				ResolutionLevelProperty->setValue(0); // Base
+			}
+		}
+	}
+
+	//QList<DzNode*> FigureNodeList = GetFigureNodeList(m_pSelectedNode);
+	DzNode* FigureNode = m_pSelectedNode;
+	//foreach(DzNode * FigureNode, FigureNodeList)
+	{
+		QList<JointLinkInfo> JointLinks = m_morphSelectionDialog->GetActiveJointControlledMorphs(FigureNode);
+		for (auto JointLink : JointLinks)
+		{
+			if (JointLink.IsBaseJCM)
+			{
+				exportNodeexportJCMDualQuatDiff(JointLink);
+			}
+		}
+	}
+
+	// Set the resolution level back to what it was
+	if (ResolutionLevelProperty)
+	{
+		ResolutionLevelProperty->setValue(ResolutionLevel);
+	}
+}
+void DzBridgeAction::exportNodeexportJCMDualQuatDiff(const JointLinkInfo& JointInfo)
+{
+	//if (JointInfo.Bone != "l_upperarm") return;
+
+	float RotationAmount = 90.0f;
+
+	if (JointInfo.Scalar != 0.0f && JointInfo.Keys.count() == 0)
+	{
+		RotationAmount = 1.0f / JointInfo.Scalar;
+	}
+
+	if (JointInfo.Keys.count() > 0)
+	{
+		for (JointLinkKey Key : JointInfo.Keys)
+		{
+			if (Key.Value == 1)
+			{
+				RotationAmount = Key.Angle;
+			}
+		}
+
+		//Remove the rotation for the largest 0 key
+		// We're only rotating by the applied amount of the JCM, not the max angle
+		for (JointLinkKey Key : JointInfo.Keys)
+		{
+			if (Key.Value == 0 && abs(Key.Angle) > 0.1f)
+			{
+				float Ratio = pow(abs(sinf(0.01745329251 * (RotationAmount - Key.Angle))), 0.5f);
+				RotationAmount *= Ratio;
+
+				// Extreme rotations turn inside out in spots.
+				if (RotationAmount > 120.0f) RotationAmount = 120.0f;
+				if (RotationAmount < -120.0f) RotationAmount = -120.0f;
+			}
+		}
+	}
+
+
+
+	DzSkeleton* Skeleton = m_pSelectedNode->getSkeleton();
+	DzFigure* Figure = Skeleton ? qobject_cast<DzFigure*>(Skeleton) : NULL;
+
+	DzSkinBinding* Binding = Figure->getSkinBinding();
+
+	DzObject* Object = m_pSelectedNode->getObject();
+
+	DzGeometry* Geometry = Object->getCurrentShape()->getGeometry();
+
+	DzBone* Bone = Skeleton->findBone(JointInfo.Bone);
+	if (Bone == nullptr) return;
+	if (JointInfo.Axis == "XRotate")
+	{
+		Bone->getXRotControl()->setValue(RotationAmount);
+	}
+	if (JointInfo.Axis == "YRotate")
+	{
+		Bone->getYRotControl()->setValue(RotationAmount);
+	}
+	if (JointInfo.Axis == "ZRotate")
+	{
+		Bone->getZRotControl()->setValue(RotationAmount);
+	}
+
+	setDualQuaternionBlending(Binding);
+
+	DzVertexMesh* DualQuaternionMesh = Object->getCachedGeom();
+	DzFacetMesh* CachedDualQuaternionMesh = new DzFacetMesh();
+	CachedDualQuaternionMesh->copyFrom(DualQuaternionMesh, false, false);
+
+	setLinearBlending(Binding);
+
+	createDualQuaternionToLinearBlendDiffMorph(JointInfo.Morph, CachedDualQuaternionMesh, dzScene->getPrimarySelection());
+
+	Bone->getXRotControl()->setValue(0.0f);
+	Bone->getYRotControl()->setValue(0.0f);
+	Bone->getZRotControl()->setValue(0.0f);
+
+	setDualQuaternionBlending(Binding);
+}
+
+void DzBridgeAction::setLinearBlending(DzSkinBinding* Binding)
+{
+	int methodIndex = Binding->metaObject()->indexOfMethod(QMetaObject::normalizedSignature("setGeneralMapMode(int)"));
+	if (methodIndex != -1)
+	{
+		QMetaMethod method = Binding->metaObject()->method(methodIndex);
+		int result = method.invoke((QObject*)Binding, Q_ARG(int, 0));
+		if (result != -1)
+		{
+
+		}
+	}
+
+	m_pSelectedNode->update();
+	m_pSelectedNode->finalize();
+}
+void DzBridgeAction::setDualQuaternionBlending(DzSkinBinding* Binding)
+{
+	int methodIndex = Binding->metaObject()->indexOfMethod(QMetaObject::normalizedSignature("setGeneralMapMode(int)"));
+	if (methodIndex != -1)
+	{
+		QMetaMethod method = Binding->metaObject()->method(methodIndex);
+		int result = method.invoke((QObject*)Binding, Q_ARG(int, 1));
+		if (result != -1)
+		{
+
+		}
+	}
+
+	m_pSelectedNode->update();
+	m_pSelectedNode->finalize();
+}
+
+void DzBridgeAction::createDualQuaternionToLinearBlendDiffMorph(const QString BaseMorphName, DzVertexMesh* Mesh, DzNode* Node)
+{
+	DzScript* Script = new DzScript();
+
+	Script->addLine("function myFunction(oNode, oSavedGeom, sName) {");
+	Script->addLine("var oMorphLoader = new DzMorphLoader();");
+	Script->addLine("oMorphLoader.setMorphName(sName);");
+	Script->addLine("oMorphLoader.setMorphSubdivision(true);");
+	Script->addLine("oMorphLoader.setSubdivisionBuiltResolution(0);");
+	Script->addLine("oMorphLoader.setSubdivisionMinResolution(0);");
+	Script->addLine("oMorphLoader.setSubdivisionMaxResolution(0);");
+	Script->addLine("oMorphLoader.setSubdivisionSmoothCage(false);");
+	Script->addLine("oMorphLoader.setSubdivisionMapping(DzMorphLoader.Catmark);");
+	Script->addLine("oMorphLoader.setDeltaTolerance(0.01);");
+	Script->addLine("oMorphLoader.setCreateControlProperty(true);");
+	Script->addLine("oMorphLoader.setPropertyGroupPath(\"Morph Loader Pro\");");
+	Script->addLine("oMorphLoader.setReverseDeformations(true);");
+	Script->addLine("oMorphLoader.setOverwriteExisting(DzMorphLoader.DeltasOnly);");
+	Script->addLine("oMorphLoader.setCleanUpOrphans(true);");
+	Script->addLine("oMorphLoader.setMorphMirroring(DzMorphLoader.DoNotMirror);");
+	//Script->addLine("oMorphLoader.applyReverseDeformationsPose();");
+	Script->addLine("var result = oMorphLoader.createMorphFromMesh(oSavedGeom, oNode);");
+	Script->addLine("};");
+
+	QString NewMorphName = BaseMorphName + "_dq2lb";
+
+	QVariantList Args;
+	QVariant v(QMetaType::QObjectStar, &Node);
+	Args.append(QVariant(QMetaType::QObjectStar, &Node));
+	Args.append(QVariant(QMetaType::QObjectStar, &Mesh));
+	Args.append(QVariant(NewMorphName));
+	Script->call("myFunction", Args);
+}
+
+QList<DzNode*> DzBridgeAction::GetFigureNodeList(DzNode* Node)
+{
+	QList<DzNode*> FigureList;
+	DzSkeleton* Skeleton = Node->getSkeleton();
+	DzFigure* Figure = Skeleton ? qobject_cast<DzFigure*>(Skeleton) : NULL;
+	if (Figure != NULL)
+	{
+		FigureList.append(Node);
+	}
+
+	// Looks through the child nodes for more bones
+	for (int ChildIndex = 0; ChildIndex < Node->getNumNodeChildren(); ChildIndex++)
+	{
+		DzNode* ChildNode = Node->getNodeChild(ChildIndex);
+		FigureList.append(GetFigureNodeList(ChildNode));
+	}
+	return FigureList;
+}
+
+void DzBridgeAction::lockBoneControls(DzNode* Bone)
+{
+	Bone->getScaleControl()->lock(true);
+	Bone->getScaleControl()->setOverrideControllers(true);
+
+	Bone->getOriginXControl()->lock(true);
+	Bone->getOriginXControl()->setOverrideControllers(true);
+	Bone->getEndXControl()->lock(true);
+	Bone->getEndXControl()->setOverrideControllers(true);
+
+	Bone->getOriginYControl()->lock(true);
+	Bone->getOriginYControl()->setOverrideControllers(true);
+	Bone->getEndYControl()->lock(true);
+	Bone->getEndYControl()->setOverrideControllers(true);
+
+	Bone->getOriginZControl()->lock(true);
+	Bone->getOriginZControl()->setOverrideControllers(true);
+	Bone->getEndZControl()->lock(true);
+	Bone->getEndZControl()->setOverrideControllers(true);
+
+	// Looks through the child nodes for more bones
+	for (int ChildIndex = 0; ChildIndex < Bone->getNumNodeChildren(); ChildIndex++)
+	{
+		DzNode* ChildNode = Bone->getNodeChild(ChildIndex);
+		lockBoneControls(ChildNode);
+	}
+}
+
+void DzBridgeAction::unlockBoneControl(DzNode* Bone)
+{
+	Bone->getScaleControl()->lock(false);
+	Bone->getScaleControl()->setOverrideControllers(false);
+
+	Bone->getOriginXControl()->lock(false);
+	Bone->getOriginXControl()->setOverrideControllers(false);
+	Bone->getEndXControl()->lock(false);
+	Bone->getEndXControl()->setOverrideControllers(false);
+
+	Bone->getOriginYControl()->lock(false);
+	Bone->getOriginYControl()->setOverrideControllers(false);
+	Bone->getEndYControl()->lock(false);
+	Bone->getEndYControl()->setOverrideControllers(false);
+
+	Bone->getOriginZControl()->lock(false);
+	Bone->getOriginZControl()->setOverrideControllers(false);
+	Bone->getEndZControl()->lock(false);
+	Bone->getEndZControl()->setOverrideControllers(false);
+
+	// Looks through the child nodes for more bones
+	for (int ChildIndex = 0; ChildIndex < Bone->getNumNodeChildren(); ChildIndex++)
+	{
+		DzNode* ChildNode = Bone->getNodeChild(ChildIndex);
+		lockBoneControls(ChildNode);
 	}
 }
 
@@ -1948,13 +2381,27 @@ QString DzBridgeAction::exportAssetWithDtu(QString sFilename, QString sAssetMate
 
 	QString exportPath = this->m_sRootFolder.replace("\\","/") + "/" + this->m_sExportSubfolder.replace("\\", "/");
 	QString fileStem = QFileInfo(sFilename).fileName();
+	// DB 2023-Oct-20: add partial path for short filenames
+	QString sNameTest = QFileInfo(sFilename).baseName().remove(QRegExp("[^A-Za-z]")).remove("base").remove("color").remove("normal").remove("roughness").remove("metallic").remove("height").remove("opengl");
+	if (isTemporaryFile(sFilename) == false &&
+		sNameTest.length() < 3 &&
+		QFileInfo(sFilename).baseName().length() < 20)
+	{
+		QStringList filePathArray = cleanedFilename.remove(" ").split("/");
+		int len = filePathArray.count();
+		for (int i = 2; i < 5; i++)
+		{
+			if (i > len) break;
+			fileStem = filePathArray[len - i] + "_" + fileStem;
+		}
+	}
 
 	exportPath += "/ExportTextures/";
 	QDir().mkpath(exportPath);
 //	QString exportFilename = exportPath + cleanedAssetMaterialName + "_" + fileStem;
 	QString exportFilename = exportPath + fileStem;
 
-	exportFilename = makeUniqueFilename(exportFilename);
+	exportFilename = makeUniqueFilename(exportFilename, sFilename);
 
 	if (QFile(sFilename).copy(exportFilename) == true)
 	{
@@ -1963,31 +2410,79 @@ QString DzBridgeAction::exportAssetWithDtu(QString sFilename, QString sAssetMate
 
 	// copy method may fail if file already exists,
 	// if exists and same file size, then proceed as if successful
+	ulong crc32_Source = calcCRC32(sFilename);
+	int bFirstCRCResult = getCalcCRC32ResultCode();
+	if (bFirstCRCResult != CalcCRC32ResultCodes::SUCCESS)
+	{
+		dzApp->log("ERROR: exportAssetWithDTU(): CalcCRC32 was not successful for: " + sFilename);
+	}
+	ulong crc32_Dest = calcCRC32(exportFilename);
+	int bSecondCRCResult = getCalcCRC32ResultCode();
+	if (bSecondCRCResult != CalcCRC32ResultCodes::SUCCESS)
+	{
+		dzApp->log("ERROR: exportAssetWithDTU(): CalcCRC32 was not successful for: " + exportFilename);
+	}
 	if ( QFileInfo(exportFilename).exists() &&
-		QFileInfo(sFilename).size() == QFileInfo(exportFilename).size())
+		QFileInfo(sFilename).size() == QFileInfo(exportFilename).size() &&
+		bFirstCRCResult == CalcCRC32ResultCodes::SUCCESS &&
+		bSecondCRCResult == CalcCRC32ResultCodes::SUCCESS &&
+		crc32_Source == crc32_Dest )
 	{
 		return exportFilename;
 	}
 
 	// return original source string if failed
+	dzApp->log("ERROR: exportAssetWithDTU(): Unexpected error occured while preparing file: " + sFilename);
 	return sFilename;
 
 }
 
-QString DzBridgeAction::makeUniqueFilename(QString sFilename)
+unsigned int DzBridgeAction::calcCRC32(QString sFilename)
 {
-	if (QFileInfo(sFilename).exists() != true)
-		return sFilename;
+	ulong crc32Result = 0;
+	m_nCalcCRC32ResultCode = CalcCRC32ResultCodes::SUCCESS;
 
-	QString newFilename = sFilename;
-	int duplicate_count = 0;
-
-	while (
-		QFileInfo(newFilename).exists() &&
-		QFileInfo(sFilename).size() != QFileInfo(newFilename).size()
-		)
+	QFile oFile(sFilename);
+	if (oFile.open(QIODevice::OpenModeFlag::ReadOnly) == false)
 	{
-		newFilename = sFilename + QString("_%i").arg(duplicate_count++);
+		m_nCalcCRC32ResultCode = CalcCRC32ResultCodes::ERROR_OPENING_FILE;
+		return 0;
+	}
+
+	QByteArray byteArray = oFile.readAll();
+	crc32Result = (ulong) ::mz_crc32((ulong)crc32Result, (const unsigned char*) byteArray.constData(), byteArray.size());
+
+	oFile.close();
+
+	return crc32Result;
+}
+
+// 2023-Oct-23: Method now works (mostly), size file check supplemented with CRC32 as file content hash.
+QString DzBridgeAction::makeUniqueFilename(QString sTargetFilename, QString sOriginalFilename)
+{
+	if (QFileInfo(sTargetFilename).exists() != true)
+		return sTargetFilename;
+
+	QString newFilename = sTargetFilename;
+	int duplicate_count = 0;	
+
+	while (QFileInfo(newFilename).exists())
+	{
+		if (sOriginalFilename != "")
+		{
+			if ( QFileInfo(sOriginalFilename).size() == QFileInfo(newFilename).size() &&
+				calcCRC32(sOriginalFilename) == calcCRC32(newFilename) )
+			{
+				// OK to use as unique, because original and new file are equivalent (per CRC32)
+				// TODO: replace with MD5 or SHA to reduce frequency of false positive
+				break;
+			}
+		}
+		QFileInfo fileInfo(sTargetFilename);
+		QString sExt = fileInfo.suffix();
+		QString sNameWtihoutExt = fileInfo.completeBaseName();
+		QString sPath = fileInfo.path();
+		newFilename = sPath + "/" + sNameWtihoutExt + QString("_%1").arg(duplicate_count++) + "." + sExt;
 	}
 
 	return newFilename;
@@ -2057,13 +2552,16 @@ void DzBridgeAction::writeDTUHeader(DzJsonWriter& writer)
 }
 
 // Write out all the surface properties
-void DzBridgeAction::writeAllMaterials(DzNode* Node, DzJsonWriter& Writer, QTextStream* pCVSStream, bool bRecursive)
+void DzBridgeAction::writeAllMaterials(DzNode* Node, DzJsonWriter& Writer, QTextStream* pCSVstream, bool bRecursive)
 {
 	if (Node == nullptr)
 		return;
 
 	if (!bRecursive)
+	{
+		m_aProcessedFiles.clear();
 		Writer.startMemberArray("Materials", true);
+	}
 
 	DzObject* Object = Node->getObject();
 	DzShape* Shape = Object ? Object->getCurrentShape() : nullptr;
@@ -2076,43 +2574,36 @@ void DzBridgeAction::writeAllMaterials(DzNode* Node, DzJsonWriter& Writer, QText
 			if (Material)
 			{
 				auto propertyList = Material->propertyListIterator();
-				startMaterialBlock(Node, Writer, pCVSStream, Material);
+				startMaterialBlock(Node, Writer, pCSVstream, Material);
 				while (propertyList.hasNext())
 				{
-					writeMaterialProperty(Node, Writer, pCVSStream, Material, propertyList.next());
+					writeMaterialProperty(Node, Writer, pCSVstream, Material, propertyList.next());
 				}
 				finishMaterialBlock(Writer);
 			}
 		}
 	}
 
-	// Check if Genitalia exists, add extra material block with parent's header info
-	DzPresentation* presentation = Node->getPresentation();
-	if (Shape && presentation)
+	// Check if Node is a geograft, add extra material block with parent's header info
+	if (isGeograft(Node))
 	{
-		const QString presentationType = presentation->getType();
-		if (Node->getName().toLower().contains("genital") ||
-			presentationType == "Follower/Attachment/Lower-Body/Hip/Front" ||
-			presentationType == "Follower/Attachment/Lower-Body")
+		// get parent node
+		DzNode* ParentNode = Node->getNodeParent();
+		if (ParentNode)
 		{
-			// get parent node
-			DzNode* ParentNode = Node->getNodeParent();
-			if (ParentNode)
+			for (int i = 0; i < Shape->getNumMaterials(); i++)
 			{
-				for (int i = 0; i < Shape->getNumMaterials(); i++)
+				DzMaterial* Material = Shape->getMaterial(i);
+				if (Material)
 				{
-					DzMaterial* Material = Shape->getMaterial(i);
-					if (Material)
+					auto propertyList = Material->propertyListIterator();
+					// Custom Header
+					startMaterialBlock(ParentNode, Writer, pCSVstream, Material);
+					while (propertyList.hasNext())
 					{
-						auto propertyList = Material->propertyListIterator();
-						// Custom Header
-						startMaterialBlock(ParentNode, Writer, pCVSStream, Material);
-						while (propertyList.hasNext())
-						{
-							writeMaterialProperty(ParentNode, Writer, pCVSStream, Material, propertyList.next());
-						}
-						finishMaterialBlock(Writer);
+						writeMaterialProperty(ParentNode, Writer, pCSVstream, Material, propertyList.next());
 					}
+					finishMaterialBlock(Writer);
 				}
 			}
 		}
@@ -2122,14 +2613,17 @@ void DzBridgeAction::writeAllMaterials(DzNode* Node, DzJsonWriter& Writer, QText
 	while (Iterator.hasNext())
 	{
 		DzNode* Child = Iterator.next();
-		writeAllMaterials(Child, Writer, pCVSStream, true);
+		writeAllMaterials(Child, Writer, pCSVstream, true);
 	}
 
 	if (!bRecursive)
+	{
 		Writer.finishArray();
+	}
+
 }
 
-void DzBridgeAction::startMaterialBlock(DzNode* Node, DzJsonWriter& Writer, QTextStream* pCVSStream, DzMaterial* Material)
+void DzBridgeAction::startMaterialBlock(DzNode* Node, DzJsonWriter& Writer, QTextStream* pCSVstream, DzMaterial* Material)
 {
 	if (Node == nullptr || Material == nullptr)
 		return;
@@ -2166,9 +2660,9 @@ void DzBridgeAction::startMaterialBlock(DzNode* Node, DzJsonWriter& Writer, QTex
 		Writer.addMember("Texture", QString(""));
 		Writer.finishObject();
 
-		if (m_bExportMaterialPropertiesCSV && pCVSStream)
+		if (m_bExportMaterialPropertiesCSV && pCSVstream)
 		{
-			*pCVSStream << "2, " << Node->getLabel() << ", " << Material->getName() << ", " << Material->getMaterialName() << ", " << "Asset Type" << ", " << presentationType << ", " << "String" << ", " << "" << endl;
+			*pCSVstream << "2, " << Node->getLabel() << ", " << Material->getName() << ", " << Material->getMaterialName() << ", " << "Asset Type" << ", " << presentationType << ", " << "String" << ", " << "" << endl;
 		}
 	}
 }
@@ -2181,7 +2675,7 @@ void DzBridgeAction::finishMaterialBlock(DzJsonWriter& Writer)
 
 }
 
-void DzBridgeAction::writeMaterialProperty(DzNode* Node, DzJsonWriter& Writer, QTextStream* pCVSStream, DzMaterial* Material, DzProperty* Property)
+void DzBridgeAction::writeMaterialProperty(DzNode* Node, DzJsonWriter& Writer, QTextStream* pCSVstream, DzMaterial* Material, DzProperty* Property)
 {
 	if (Node == nullptr || Material == nullptr || Property == nullptr)
 		return;
@@ -2241,28 +2735,208 @@ void DzBridgeAction::writeMaterialProperty(DzNode* Node, DzJsonWriter& Writer, Q
 	}
 
 	QString dtuTextureName = TextureName;
-	if (TextureName != "")
+	if ( !TextureName.isEmpty() && m_aProcessedFiles.contains(TextureName, Qt::CaseInsensitive)==false)
 	{
-		if (this->m_bUseRelativePaths)
+
+		// DB, 2023-10-27: New integrated resizing/re-encoding integrated save pathway
+		// Execution Flow:
+		// 1. Check if any re-encoding operation is enabled (m_bResizeTextures || m_bRecompressIfFileSizeTooBig || m_bConverToPng || m_bConverToJpg)
+		// 2. If so then use the following order of operations:
+		// 3. ResizeTextures takes highest priority
+		// 4. RecompressIfFileSizeTooBig is second
+		// 5. Convert non-PNG/JPG to PNG/JPG takes third
+		if (m_bForceReEncoding || m_bResizeTextures || m_bRecompressIfFileSizeTooBig || m_bConvertToPng || m_bConvertToJpg)
 		{
-			dtuTextureName = dzApp->getContentMgr()->getRelativePath(TextureName, true);
+			DzImageMgr* imageMgr = dzApp->getImageMgr();
+			QImage image = imageMgr->loadImage(TextureName);
+			QString cleanedTempPath = dzApp->getTempPath().toLower().replace("\\", "/");
+			QFileInfo fileInfo(TextureName);
+			QString filestem = fileInfo.fileName();
+			QString fileTypeExtension = fileInfo.suffix().toLower();
+			int customEncodingQuality = 95;
+			QSize customImageSize = m_qTargetTextureSize;
+			bool bHasAlpha = image.hasAlphaChannel();
+			bool bSkip = true;
+
+			if (m_bForceReEncoding) bSkip = false;
+			if (fileTypeExtension == "jpeg") fileTypeExtension = "jpg";
+			if (fileTypeExtension == "jpg") customEncodingQuality = 95;
+			if (fileTypeExtension == "png") customEncodingQuality = 75;
+
+			// adjust on target quality/compression level if needed
+			if (m_bRecompressIfFileSizeTooBig &&
+				(QFileInfo(TextureName).size() > m_nFileSizeThresholdToInitiateRecompression)
+				)
+			{
+				fileTypeExtension = "jpg";
+				if (bHasAlpha && m_bConvertToPng) // default to jpg, unless png=true and jpg=false
+					fileTypeExtension = "png";
+				// if image.size is already <= m_qTargetTextureSize, then reduce even further
+				if (image.size().width() <= m_qTargetTextureSize.width() &&
+					image.size().height() <= m_qTargetTextureSize.height())
+				{
+					customImageSize = m_qTargetTextureSize / 2;
+				}
+				// decrease encoding quality if file was originally JPG, note: check against original name/ext
+				customEncodingQuality -= 25;
+				bSkip = false;
+			}
+
+			// resize image if needed
+			if (customImageSize != m_qTargetTextureSize ||
+					m_bResizeTextures && 
+					(image.size().width() > m_qTargetTextureSize.width() ||
+					image.size().height() > m_qTargetTextureSize.height())
+				)
+			{
+				image = image.scaled(customImageSize, Qt::KeepAspectRatio, Qt::SmoothTransformation);
+				bSkip = false;
+			}
+
+			// decide on target encoding
+			if (m_bConvertToPng &&
+					(fileTypeExtension.compare("png", Qt::CaseInsensitive) != 0)
+				)
+			{
+				fileTypeExtension = "png";
+				bSkip = false;
+			}
+
+			// decide on target encoding (JPG will override PNG above)
+			if (m_bConvertToJpg &&
+					(fileTypeExtension.compare("jpg", Qt::CaseInsensitive) != 0)
+				)
+			{
+				fileTypeExtension = "jpg";
+				if (m_bConvertToPng && bHasAlpha) // png+alpha takes priority over jpg
+					fileTypeExtension = "png";
+				bSkip = false;
+			}
+
+			if (!bSkip)
+			{
+				// finally, save out file with final resized image, quality level and encoding format
+				QString recompressedFilename = cleanedTempPath + "/" + filestem + "." + fileTypeExtension;
+				if (recompressedFilename.split(".").count() > 3)
+				{
+					dzApp->log("WARNING: multiple file extensions possibly detected: " + recompressedFilename);
+				}
+				if (image.save(recompressedFilename, 0, customEncodingQuality) == true)
+				{
+					// only perform if save was successful
+					dtuTextureName = TextureName = recompressedFilename;
+				}
+				else
+				{
+					dzApp->log("ERROR: saving file failed: " + recompressedFilename);
+				}
+
+			}
+
+		///////////////////////
 		}
-		if (isTemporaryFile(TextureName))
+
+// DB, 2023-10-27: Above code block replaces this commented out section
+/****
+		if (m_bResizeTextures)
+		{
+			DzImageMgr* imageMgr = dzApp->getImageMgr();
+			QImage image = imageMgr->loadImage(TextureName);
+			if (image.size().width() > m_qTargetTextureSize.width() ||
+				image.size().height() > m_qTargetTextureSize.height())
+			{
+				image = image.scaled(m_qTargetTextureSize, Qt::KeepAspectRatio, Qt::SmoothTransformation);
+				QString cleanedTempPath = dzApp->getTempPath().toLower().replace("\\", "/");
+				QString filestem = QFileInfo(TextureName).fileName();
+				QString resizedFilename = cleanedTempPath + "/" + filestem;
+				imageMgr->saveImage(resizedFilename, image);
+				dtuTextureName = TextureName = resizedFilename;
+			}
+		}
+		// DB 2023-Oct-23: Recompress if filesize too big
+		if (m_bRecompressIfFileSizeTooBig)
+		{
+			// only re-compress to jpeg if file is large
+			if (QFileInfo(TextureName).size() > m_nFileSizeThresholdToInitiateRecompression)
+			{
+				// load image and resave as PNG
+				DzImageMgr* imageMgr = dzApp->getImageMgr();
+				QImage image = imageMgr->loadImage(TextureName);
+				bool bHasAlpha = image.hasAlphaChannel();
+				QString cleanedTempPath = dzApp->getTempPath().toLower().replace("\\", "/");
+				QString filestem = QFileInfo(TextureName).fileName();
+				QString recompressedFilename;
+				QString fileTypeExtension = ".jpg";
+				if (bHasAlpha || !m_bConvertToJpg && m_bConvertToPng) // default to jpg, unless png=true and jpg=false
+					fileTypeExtension = ".png";
+				recompressedFilename = cleanedTempPath + "/" + filestem + fileTypeExtension;
+				if (fileTypeExtension == ".png")
+				{
+					if (image.save(recompressedFilename, "png", 95) == false) // 95% quality
+					{
+						dzApp->log("ERROR: saving file failed: " + recompressedFilename);
+					}
+				}
+				else
+				{
+					if (image.save(recompressedFilename, "jpg", 95) == false) // 95% quality
+					{
+						dzApp->log("ERROR: saving file failed: " + recompressedFilename);
+					}
+
+				}
+				dtuTextureName = TextureName = recompressedFilename;
+			}
+		}
+		// DB 2023-Oct-5: Save to PNG or JPG, Export all Textures
+		if (m_bConvertToPng || m_bConvertToJpg)
+		{
+			if (TextureName.endsWith(".png", Qt::CaseInsensitive) == false &&
+				TextureName.endsWith(".jpg", Qt::CaseInsensitive) == false &&
+				TextureName.endsWith(".jpeg", Qt::CaseInsensitive) == false)
+			{
+				// load image and resave as PNG
+				DzImageMgr* imageMgr = dzApp->getImageMgr();
+				QImage image = imageMgr->loadImage(TextureName);
+				bool bHasAlpha = image.hasAlphaChannel();
+				QString cleanedTempPath = dzApp->getTempPath().toLower().replace("\\", "/");
+				QString filestem = QFileInfo(TextureName).fileName();
+				QString fileTypeExtension = ".png";
+				if (m_bConvertToJpg && !bHasAlpha) // jpg conversion takes priority over png
+					fileTypeExtension = ".jpg";
+				QString pngFilename = cleanedTempPath + "/" + filestem + fileTypeExtension;
+				imageMgr->saveImage(pngFilename, image);
+				dtuTextureName = TextureName = pngFilename;
+			}
+		}
+****/
+
+
+		if (m_bExportAllTextures)
 		{
 			dtuTextureName = exportAssetWithDtu(TextureName, Node->getLabel() + "_" + Material->getName());
 		}
+		else if (m_bUseRelativePaths)
+		{
+			dtuTextureName = dzApp->getContentMgr()->getRelativePath(TextureName, true);
+		}
+		else if (isTemporaryFile(TextureName))
+		{
+			dtuTextureName = exportAssetWithDtu(TextureName, Node->getLabel() + "_" + Material->getName());
+		}
+		m_aProcessedFiles.append(TextureName);
 	}
 	if (bUseNumeric)
 		writePropertyTexture(Writer, Name, sLabel, dtuPropNumericValue, dtuPropType, dtuTextureName);
 	else
 		writePropertyTexture(Writer, Name, sLabel, dtuPropValue, dtuPropType, dtuTextureName);
 
-	if (m_bExportMaterialPropertiesCSV && pCVSStream)
+	if (m_bExportMaterialPropertiesCSV && pCSVstream)
 	{
 		if (bUseNumeric)
-			*pCVSStream << "2, " << Node->getLabel() << ", " << Material->getName() << ", " << Material->getMaterialName() << ", " << Name << ", " << dtuPropNumericValue << ", " << dtuPropType << ", " << TextureName << endl;
+			*pCSVstream << "2, " << Node->getLabel() << ", " << Material->getName() << ", " << Material->getMaterialName() << ", " << Name << ", " << dtuPropNumericValue << ", " << dtuPropType << ", " << TextureName << endl;
 		else
-			*pCVSStream << "2, " << Node->getLabel() << ", " << Material->getName() << ", " << Material->getMaterialName() << ", " << Name << ", " << dtuPropValue << ", " << dtuPropType << ", " << TextureName << endl;
+			*pCSVstream << "2, " << Node->getLabel() << ", " << Material->getName() << ", " << Material->getMaterialName() << ", " << Name << ", " << dtuPropValue << ", " << dtuPropType << ", " << TextureName << endl;
 	}
 	return;
 
@@ -2383,6 +3057,7 @@ void DzBridgeAction::writeMorphLinks(DzJsonWriter& writer)
 			QString sMorphLabel = morphNameToLabel.value();
 			MorphInfo morphInfo = m_morphSelectionDialog->GetMorphInfoFromName(sMorphName);
 			DzProperty *morphProperty = morphInfo.Property;
+			if (morphProperty == nullptr) continue; // The added dq2lb morphs won't have properties yet
 			QStringList controlledMeshList = checkMorphControlsChildren(m_pSelectedNode, morphProperty);
 			if (morphInfo.Node != nullptr)
 			{
@@ -2611,7 +3286,7 @@ void DzBridgeAction::writeSubdivisionProperties(DzJsonWriter& writer, const QStr
 	writer.finishObject();
 }
 
-void DzBridgeAction::writeAllDforceInfo(DzNode* Node, DzJsonWriter& Writer, QTextStream* pCVSStream, bool bRecursive)
+void DzBridgeAction::writeAllDforceInfo(DzNode* Node, DzJsonWriter& Writer, QTextStream* pCSVstream, bool bRecursive)
 {
 	if (Node == nullptr)
 		return;
@@ -2683,14 +3358,14 @@ void DzBridgeAction::writeAllDforceInfo(DzNode* Node, DzJsonWriter& Writer, QTex
 	while (Iterator.hasNext())
 	{
 		DzNode* Child = Iterator.next();
-		writeAllDforceInfo(Child, Writer, pCVSStream, true);
+		writeAllDforceInfo(Child, Writer, pCSVstream, true);
 	}
 
 	if (!bRecursive)
 	{
 		if (m_sAssetType == "SkeletalMesh")
 		{
-			bool ExportDForce = true;
+			bool ExportDForce = false;
 			Writer.startMemberArray("dForce-WeightMaps", true);
 			if (ExportDForce)
 			{
@@ -2795,6 +3470,11 @@ void DzBridgeAction::writeEnvironment(DzJsonWriter& writer)
 	writer.finishArray();
 }
 
+void DzBridgeAction::writeMLDeformerData(DzJsonWriter& writer)
+{
+	writer.addMember("AlembicFile", m_sDestinationPath + m_sExportFilename + ".abc");
+}
+
 void DzBridgeAction::writeInstances(DzNode* Node, DzJsonWriter& Writer, QMap<QString, DzMatrix3>& WritenInstances, QList<DzGeometry*>& ExportedGeometry, QUuid ParentID)
 {
 	if (Node == nullptr)
@@ -2854,7 +3534,7 @@ QUuid DzBridgeAction::writeInstance(DzNode* Node, DzJsonWriter& Writer, QUuid Pa
 
 	// Instance Node needs an InstanceAsset
 	DzInstanceNode* InstanceNode = qobject_cast<DzInstanceNode*>(Node);
-	if (InstanceNode)
+	if (InstanceNode && InstanceNode->getTarget())
 	{
 		AssetID = InstanceNode->getTarget()->getAssetUri().getId();
 		Name = AssetID.remove(QRegExp("[^A-Za-z0-9_]"));
@@ -2913,13 +3593,26 @@ bool DzBridgeAction::readGui(DzBridgeDialog* BridgeDialog)
 	if (m_nNonInteractiveMode == 0)
 	{
 		// TODO: consider removing once findData( ) method above is completely implemented
-		m_sAssetType = cleanString(BridgeDialog->getAssetTypeCombo()->currentText());
+		//m_sAssetType = cleanString(BridgeDialog->getAssetTypeCombo()->currentText());
+		// TEMP WORKAROUND FOR NEW ASSET TYPES
+		QComboBox* wAssetCombo = BridgeDialog->getAssetTypeCombo();
+		int nIndex = wAssetCombo->currentIndex();
+		if (wAssetCombo->itemData(nIndex).isNull())
+		{
+			m_sAssetType = cleanString(wAssetCombo->currentText());
+		}
+		else
+		{
+			m_sAssetType = cleanString(wAssetCombo->itemData(nIndex).toString());
+		}
 
+		m_bEnableMorphs = BridgeDialog->getMorphsEnabledCheckBox()->isChecked();
 		m_sMorphSelectionRule = BridgeDialog->GetMorphString();
 		resetArray_ControllersToDisconnect();
 		m_ControllersToDisconnect.append(m_morphSelectionDialog->getMorphNamesToDisconnectList());
-		m_mMorphNameToLabel = BridgeDialog->GetMorphMapping();
+		m_mMorphNameToLabel = BridgeDialog->GetMorphMappingFromMorphSelectionDialog();
 		m_bEnableMorphs = BridgeDialog->getMorphsEnabledCheckBox()->isChecked();
+		m_aPoseExportList = BridgeDialog->GetPoseList();
 	}
 
 	m_EnableSubdivisions = BridgeDialog->getSubdivisionEnabledCheckBox()->isChecked();
@@ -2927,10 +3620,38 @@ bool DzBridgeAction::readGui(DzBridgeDialog* BridgeDialog)
 	m_sFbxVersion = BridgeDialog->getFbxVersionCombo()->currentText();
 	m_bGenerateNormalMaps = BridgeDialog->getEnableNormalMapGenerationCheckBox()->isChecked();
 
+	// Check for irreversible operations, warn user and give opportunity to cancel
+	if (m_bEnableMorphs)
+	{
+		if (checkForIrreversibleOperations_in_disconnectOverrideControllers() == true && m_nNonInteractiveMode == 0)
+		{
+			// warn user
+			auto userChoice = QMessageBox::question(0, "Daz Bridge",
+				tr("You are exporting morph controllers that are \"connected\" or controlling \n\
+the strength of other morphs that are also being exported. \n\n\
+To prevent morph values from exponential growth to 200% or more \n\
+(aka \"Double-Dipping\"), we must now disconnect all linked morph \n\
+controllers. This may cause irreversible changes to your scene.\n\n\
+Are you ready to proceed, or do you want to Cancel to save your changes?"),
+QMessageBox::Yes | QMessageBox::Cancel,
+				QMessageBox::Yes);
+			if (userChoice == QMessageBox::StandardButton::Cancel)
+				return false;
+		}
+	}
+
 	m_bAnimationUseExperimentalTransfer = BridgeDialog->getExperimentalAnimationExportCheckBox()->isChecked();
 	m_bAnimationBake = BridgeDialog->getBakeAnimationExportCheckBox()->isChecked();
 	m_bAnimationTransferFace = BridgeDialog->getFaceAnimationExportCheckBox()->isChecked();
 	m_bAnimationExportActiveCurves = BridgeDialog->getAnimationExportActiveCurvesCheckBox()->isChecked();
+	m_bAnimationApplyBoneScale = BridgeDialog->getAnimationApplyBoneScaleCheckBox()->isChecked();
+
+	m_bMorphLockBoneTranslation = BridgeDialog->getMorphLockBoneTranslationCheckBox()->isChecked();
+
+	// LOD settings
+	m_bEnableLodGeneration = BridgeDialog->getEnableLodCheckBox()->isChecked();
+
+	return true;
 }
 
 // ------------------------------------------------
@@ -3170,6 +3891,42 @@ QStringList DzBridgeAction::getActiveMorphs(DzNode* Node)
 	}
 
 	return newMorphList;
+}
+
+DzBridgeDialog* DzBridgeAction::getBridgeDialog() 
+{
+	if (m_bridgeDialog == nullptr)
+	{
+		DzMainWindow* mw = dzApp->getInterface();
+		if (!mw)
+		{
+			return nullptr;
+		}
+		m_bridgeDialog = new DzBridgeDialog(mw);
+		m_bridgeDialog->setBridgeActionObject(this);
+	}
+
+	return m_bridgeDialog;
+}
+
+DzBridgeSubdivisionDialog* DzBridgeAction::getSubdivisionDialog() 
+{ 
+	if (m_subdivisionDialog == nullptr)
+	{
+		m_subdivisionDialog = DzBridgeSubdivisionDialog::Get(this->getBridgeDialog());
+	}
+
+	return m_subdivisionDialog;
+}
+
+DzBridgeMorphSelectionDialog* DzBridgeAction::getMorphSelectionDialog() 
+{ 
+	if (m_morphSelectionDialog == nullptr)
+	{
+		m_morphSelectionDialog = DzBridgeMorphSelectionDialog::Get(this->getBridgeDialog());
+	}
+
+	return m_morphSelectionDialog;
 }
 
 bool DzBridgeAction::setBridgeDialog(DzBasicDialog* arg_dlg)
@@ -3562,7 +4319,6 @@ bool DzBridgeAction::metaInvokeMethod(QObject* object, const char* methodSig, vo
 #include "OpenFBXInterface.h"
 #include "OpenSubdivInterface.h"
 
-
 bool DzBridgeAction::upgradeToHD(QString baseFilePath, QString hdFilePath, QString outFilePath, std::map<std::string, int>* pLookupTable)
 {
 	OpenFBXInterface* openFBX = OpenFBXInterface::GetInterface();
@@ -3601,6 +4357,210 @@ bool DzBridgeAction::upgradeToHD(QString baseFilePath, QString hdFilePath, QStri
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 // END: SUBDIVISION
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// DEV TESTING
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+void FixClusterTranformLinks(FbxScene* Scene, FbxNode* RootNode)
+{
+	FbxGeometry* NodeGeometry = static_cast<FbxGeometry*>(RootNode->GetMesh());
+
+	// Create missing weights
+	if (NodeGeometry)
+	{
+
+		for (int DeformerIndex = 0; DeformerIndex < NodeGeometry->GetDeformerCount(); ++DeformerIndex)
+		{
+			FbxSkin* Skin = static_cast<FbxSkin*>(NodeGeometry->GetDeformer(DeformerIndex));
+			if (Skin)
+			{
+				for (int ClusterIndex = 0; ClusterIndex < Skin->GetClusterCount(); ++ClusterIndex)
+				{
+					// Get the current tranform
+					FbxAMatrix Matrix;
+					FbxCluster* Cluster = Skin->GetCluster(ClusterIndex);
+					Cluster->GetTransformLinkMatrix(Matrix);
+
+					// Update the rotation
+					FbxDouble3 Rotation = Cluster->GetLink()->PostRotation.Get();
+					Matrix.SetR(Rotation);
+					Cluster->SetTransformLinkMatrix(Matrix);
+				}
+			}
+		}
+	}
+
+	for (int ChildIndex = 0; ChildIndex < RootNode->GetChildCount(); ++ChildIndex)
+	{
+		FbxNode* ChildNode = RootNode->GetChild(ChildIndex);
+		FixClusterTranformLinks(Scene, ChildNode);
+	}
+}
+void RemoveBindPoses(FbxScene* Scene)
+{
+	for (int PoseIndex = Scene->GetPoseCount() - 1; PoseIndex >= 0; --PoseIndex)
+	{
+		Scene->RemovePose(PoseIndex);
+	}
+}
+void RemovePrePostRotations(FbxNode* pNode)
+{
+	QString sNodeName = pNode->GetName();
+	for (int nChildIndex = 0; nChildIndex < pNode->GetChildCount(); nChildIndex++)
+	{
+		FbxNode* pChildBone = pNode->GetChild(nChildIndex);
+		RemovePrePostRotations(pChildBone);
+	}
+	if (sNodeName.contains("twist", Qt::CaseInsensitive) == false)
+	{
+		pNode->SetPreRotation(FbxNode::EPivotSet::eSourcePivot, FbxVector4(0, 0, 0));
+		pNode->SetPostRotation(FbxNode::EPivotSet::eSourcePivot, FbxVector4(0, 0, 0));
+	}
+}
+void ReparentTwistBone(FbxNode* pNode)
+{
+	FbxNode* pParentNode = pNode->GetParent();
+	FbxNode* pGrandParentNode = pParentNode->GetParent();
+	QString sNodeName = pNode->GetName();
+	QString sParentName = pParentNode->GetName();
+	QString sGrandParentName = pGrandParentNode->GetName();
+
+	// Calc Position Delta to add to Child
+	FbxAMatrix mNodeLocalTransform = pNode->EvaluateLocalTransform();
+	FbxVector4 vDelta = pNode->EvaluateLocalTransform().GetT();
+	for (int nChildIndex = 0; nChildIndex < pNode->GetChildCount(); nChildIndex++)
+	{
+		FbxNode* pChildBone = pNode->GetChild(nChildIndex);
+		QString sChildName = pChildBone->GetName();
+		pNode->RemoveChild(pChildBone);
+		pParentNode->AddChild(pChildBone);
+		FbxAMatrix pChildLocalTransform = pChildBone->EvaluateLocalTransform();
+		FbxAMatrix mNewTransform = mNodeLocalTransform * pChildLocalTransform;
+		pChildBone->LclTranslation.Set(mNodeLocalTransform.GetT());
+		//pChildBone->LclRotation.Set(mNodeLocalTransform.GetR());
+		//pChildBone->LclScaling.Set(mNodeLocalTransform.GetS());
+	}
+	if (pGrandParentNode)
+	{
+//		pParentNode->RemoveChild(pNode);
+//		pGrandParentNode->AddChild(pNode);
+	}
+	else
+	{
+		printf("nop");
+	}
+
+}
+void FindAndProcessTwistBones(FbxNode* pNode)
+{
+	QString sNodeName = pNode->GetName();
+	for (int nChildIndex = 0; nChildIndex < pNode->GetChildCount(); nChildIndex++)
+	{
+		FbxNode* pChildBone = pNode->GetChild(nChildIndex);
+		FindAndProcessTwistBones(pChildBone);
+	}
+	if (sNodeName.contains("twist", Qt::CaseInsensitive))
+	{
+		ReparentTwistBone(pNode);
+	}
+}
+
+
+// Perform post-processing of Fbx after export
+// NOTE: must be called prior to writeconfiguration, otherwise can not guarantee that it will be executed before
+// import process is started in target software
+bool DzBridgeAction::postProcessFbx(QString fbxFilePath)
+{
+	if (m_bPostProcessFbx == false)
+		return false;
+
+	OpenFBXInterface* openFBX = OpenFBXInterface::GetInterface();
+	FbxScene* pScene = openFBX->CreateScene("Base Mesh Scene");
+	if (openFBX->LoadScene(pScene, fbxFilePath.toLocal8Bit().data()) == false)
+	{
+		if (m_nNonInteractiveMode == 0) QMessageBox::warning(0, "Error",
+			"An error occurred while processing the Fbx file...", QMessageBox::Ok);
+		printf("\n\nAn error occurred while processing the Fbx file...");
+		return false;
+	}
+
+	// Remove Extra Geograft nodes and geometry
+	if (m_bRemoveDuplicateGeografts)
+	{
+		for (QString searchString : m_aGeografts)
+		{
+			auto geo = openFBX->FindGeometry(pScene, searchString + ".Shape");
+			if (geo)
+			{
+				auto node = geo->GetNode();
+				node->RemoveAllMaterials();
+				pScene->RemoveGeometry(geo);
+				pScene->RemoveNode(node);
+				geo->Destroy();
+				node->Destroy();
+			}
+			auto node = openFBX->FindNode(pScene, searchString);
+			if (node)
+			{
+				pScene->RemoveNode(node);
+				node->Destroy();
+			}
+		}
+	}
+
+	if (m_bExperimental_FbxPostProcessing)
+	{
+		// Find the root bone.  There should only be one bone off the scene root
+		FbxNode* RootNode = pScene->GetRootNode();
+		FbxNode* RootBone = nullptr;
+		QString RootBoneName("");
+		for (int ChildIndex = 0; ChildIndex < RootNode->GetChildCount(); ++ChildIndex)
+		{
+			FbxNode* ChildNode = RootNode->GetChild(ChildIndex);
+			FbxNodeAttribute* Attr = ChildNode->GetNodeAttribute();
+			if (Attr && Attr->GetAttributeType() == FbxNodeAttribute::eSkeleton)
+			{
+				RootBone = ChildNode;
+				RootBoneName = RootBone->GetName();
+				RootBone->SetName("root");
+				Attr->SetName("root");
+				break;
+			}
+		}
+
+		//// Daz characters sometimes have additional skeletons inside the character for accesories
+		//if (AssetType == DazAssetType::SkeletalMesh)
+		//{
+		//	FDazToUnrealFbx::ParentAdditionalSkeletalMeshes(Scene);
+		//}
+		// Daz Studio puts the base bone rotations in a different place than Unreal expects them.
+		//if (CachedSettings->FixBoneRotationsOnImport && AssetType == DazAssetType::SkeletalMesh && RootBone)
+		//{
+		//	FDazToUnrealFbx::RemoveBindPoses(Scene);
+		//	FDazToUnrealFbx::FixClusterTranformLinks(Scene, RootBone);
+		//}
+		if (RootBone)
+		{
+			// remove pre and post rotations
+			RemovePrePostRotations(RootBone);
+	//		FindAndProcessTwistBones(RootBone);
+	//		RemoveBindPoses(pScene);
+	//		FixClusterTranformLinks(pScene, RootBone);
+		}
+	}
+
+	if (openFBX->SaveScene(pScene, fbxFilePath.toLocal8Bit().data()) == false)
+	{
+		if (m_nNonInteractiveMode == 0) QMessageBox::warning(0, "Error",
+			"An error occurred while processing the Fbx file...", QMessageBox::Ok);
+
+		printf("\n\nAn error occurred while processing the Fbx file...");
+		return false;
+	}
+
+	return true;
+
+}
 
 QString DzBridgeAction::getMD5(const QString& path)
 {
@@ -3694,31 +4654,32 @@ void DzBridgeAction::writeSkeletonData(DzNode* Node, DzJsonWriter& writer)
 	return;
 }
 
+// DB 2023-July-9: bugfix for rest pose, all getValue() replaced with getDoubleDefaultValue(), etc.
 DzVec3 calculatePrimaryAxis(DzBone* pBone, DzVec3 &vecEndVector, double nBoneLength)
 {
 	DzVec3 vecFirstAxis(0.0f, 0.0f, 0.0f);
-	double nNodeScale = pBone->getScaleControl()->getValue();
+	double nNodeScale = pBone->getScaleControl()->getDoubleDefaultValue();
 	int nSign = 1;
 	double nAxisScale = 1.0;
 	switch (pBone->getRotationOrder()[0])
 	{
 	case 0:
 		nSign = (vecEndVector.m_x >= 0) ? 1 : -1;
-		nAxisScale = pBone->getXScaleControl()->getValue();
+		nAxisScale = pBone->getXScaleControl()->getDoubleDefaultValue();
 		vecFirstAxis.m_x = nBoneLength * nSign * nAxisScale * nNodeScale;
 		break;
 	case 1:
 		nSign = (vecEndVector.m_y >= 0) ? 1 : -1;
-		nAxisScale = pBone->getYScaleControl()->getValue();
+		nAxisScale = pBone->getYScaleControl()->getDoubleDefaultValue();
 		vecFirstAxis.m_y = nBoneLength * nSign * nAxisScale * nNodeScale;
 		break;
 	case 2:
 		nSign = (vecEndVector.m_z >= 0) ? 1 : -1;
-		nAxisScale = pBone->getZScaleControl()->getValue();
+		nAxisScale = pBone->getZScaleControl()->getDoubleDefaultValue();
 		vecFirstAxis.m_z = nBoneLength * nSign * nAxisScale * nNodeScale;
 		break;
 	}
-	DzQuat quatOrientation = pBone->getOrientation();
+	DzQuat quatOrientation = pBone->getOrientation(true);
 	DzVec3 vecPrimaryAxis = quatOrientation.multVec(vecFirstAxis);
 
 	return vecPrimaryAxis;
@@ -3752,13 +4713,20 @@ DzVec3 calculateSecondaryAxis(DzBone* pBone, DzVec3& vecEndVector)
 		vecSecondAxis.m_z = nSign;
 		break;
 	}
-
-	DzQuat quatOrientation = pBone->getOrientation();
+	// DB 2023-July-9: bugfix for rest pose
+	DzQuat quatOrientation = pBone->getOrientation(true);
 	vecSecondAxis = quatOrientation.multVec(vecSecondAxis);
 
 	return vecSecondAxis;
 }
 
+
+/**
+ * \Summates ERC Y-translations to bone, iterates through all of the bones' controllers
+ * \TODO: consider renaming function to calculateERCOffsetForBone()?
+ * \param DzBone* pBone - bone of interest
+ * \return DzVec3 vecBoneOffset - final vector summation of all ERC y-translations
+ */
 DzVec3 calculateBoneOffset(DzBone* pBone)
 {
 	DzVec3 vecBoneOffset(0.0f, 0.0f, 0.0f);
@@ -3853,6 +4821,12 @@ DzPropertyList getAllProperties(DzBone* pBone)
 	return aPropertyList;
 }
 
+/**
+ * \Write DzBone head and tail data, along with orientation.  NOTE: This is used by BlenderBridge to overwrite the bindpose
+ * \so the skeleton configuration must be in in rest/zero configuration AND any baked morphs must have ERC bone values applied.
+ * \param Node 
+ * \param writer 
+ */
 void DzBridgeAction::writeHeadTailData(DzNode* Node, DzJsonWriter& writer)
 {
 	if (Node == nullptr)
@@ -3915,7 +4889,7 @@ void DzBridgeAction::writeHeadTailData(DzNode* Node, DzJsonWriter& writer)
 
 	}
 
-	// Calculate Bone Offset
+	// Calculate Bone Offset (aka ERC y-translate offset)
 	DzVec3 vecBoneOffset = calculateBoneOffset(qobject_cast<DzBone*>(aBoneList[0]));
 
 	double nSkeletonScale = pSkeleton->getScaleControl()->getValue();
@@ -3927,12 +4901,8 @@ void DzBridgeAction::writeHeadTailData(DzNode* Node, DzJsonWriter& writer)
 		DzBone* pBone = qobject_cast<DzBone*>(pObject);
 		if (pBone)
 		{
-			//// Calculate Bone Offset
-			//DzVec3 vecBoneOffset = calculateBoneOffset(pBone);
-
-
 			// Assign Head
-			DzVec3 vecHead = pBone->getOrigin(false);
+			DzVec3 vecHead = pBone->getOrigin(true);
 			if (Node->className() == "DzFigure")
 			{
 				DzFigure* figure = qobject_cast<DzFigure*>(pSkeleton);
@@ -3946,7 +4916,8 @@ void DzBridgeAction::writeHeadTailData(DzNode* Node, DzJsonWriter& writer)
 				}
 			}
 			// Calculate Bone Length
-			DzVec3 vecEndVector = pBone->getEndPoint() - pBone->getOrigin(false);
+			// DB 2023-July-9: bugfix for restpose
+			DzVec3 vecEndVector = pBone->getEndPoint(true) - pBone->getOrigin(true);
 			double nBoneLength = vecEndVector.length();
 			// Calculate Primary Axis
 			DzVec3 vecPrimaryAxis = calculatePrimaryAxis(pBone, vecEndVector, nBoneLength);
@@ -3990,16 +4961,32 @@ void DzBridgeAction::writeHeadTailData(DzNode* Node, DzJsonWriter& writer)
 				for (int i = 0; i < 3; i++)
 				{
 					QString searchLabel = QString(aAxisString[i] + QString("Translate"));
-					if (propertyItem->getName() == searchLabel && propertyItem->isHidden() == false) {
-						vecBonePosition[i] = 1;
+					if (propertyItem->getName() == searchLabel && propertyItem->isHidden() == false)
+					{
+						QString sPropertyLabel = propertyItem->getLabel().toLower().replace(" ", "");
+						searchLabel = searchLabel.toLower().replace(" ", "");
+						// Only set to 1 if label doesn't not match name (except whitespace)
+						// Example: name=xrotate but label=bend, twist, etc.
+						if (searchLabel.startsWith(sPropertyLabel) == false)
+						{
+							vecBonePosition[i] = 1;
+						}
 					}
 				}
 				// Rotation
 				for (int i = 0; i < 3; i++)
 				{
 					QString searchLabel = QString(aAxisString[i] + QString("Rotate"));
-					if (propertyItem->getName() == searchLabel && propertyItem->isHidden() == false) {
-						vecBoneRotation[i] = 1;
+					if (propertyItem->getName() == searchLabel && propertyItem->isHidden() == false)
+					{
+						QString sPropertyLabel = propertyItem->getLabel().toLower().replace(" ", "");
+						searchLabel = searchLabel.toLower().replace(" ", "");
+						// Only set to 1 if label doesn't not match name (except whitespace)
+						// Example: name=xrotate but label=bend, twist, etc.
+						if (searchLabel.startsWith(sPropertyLabel) == false)
+						{
+							vecBoneRotation[i] = 1;
+						}
 					}
 				}
 				// Scale
@@ -4029,11 +5016,12 @@ void DzBridgeAction::writeJointOrientation(DzBoneList& aBoneList, DzJsonWriter& 
 	for (DzBone* pBone : aBoneList)
 	{
 		QString sBoneName = pBone->getName();
+		// DB 2023-July-9: bugfix for restpose
 		QString sRotationOrder = pBone->getRotationOrder().toString();
-		double nXOrientation = pBone->getOrientXControl()->getValue();
-		double nYOrientation = pBone->getOrientYControl()->getValue();
-		double nZOrientation = pBone->getOrientZControl()->getValue();
-		DzQuat quatOrientation = pBone->getOrientation();
+		double nXOrientation = pBone->getOrientXControl()->getDoubleDefaultValue();
+		double nYOrientation = pBone->getOrientYControl()->getDoubleDefaultValue();
+		double nZOrientation = pBone->getOrientZControl()->getDoubleDefaultValue();
+		DzQuat quatOrientation = pBone->getOrientation(true);
 
 		writer.startMemberArray(sBoneName, true);
 		writer.addItem(sRotationOrder);
@@ -4181,14 +5169,30 @@ void DzBridgeAction::writePoseData(DzNode* Node, DzJsonWriter& writer, bool bIsF
 	if (Node == nullptr)
 		return;
 
+	// Top Nodes List
+	auto aTopNodes = Node->getNodeChildren(false);
+	if (aTopNodes.length() == 0 && !bIsFigure)
+	{
+		aTopNodes.push_back(Node);
+	}
+
 	// Create Node List
 	DzNodeList aNodeList;
 
 	aNodeList.append(Node);
-	for (auto item : Node->getNodeChildren(true))
+	for (auto item : aTopNodes)
 	{
 		DzNode* nodeItem = qobject_cast<DzNode*>(item);
+		if (bIsFigure && !nodeItem->inherits("DzBone"))
+		{
+			continue;
+		}
 		aNodeList.append(nodeItem);
+		for (auto child : nodeItem->getNodeChildren(true))
+		{
+			DzNode* nodeChild = qobject_cast<DzNode*>(child);
+			aNodeList.append(nodeChild);
+		}
 	}
 
 	writer.startMemberObject("PoseData");
@@ -4202,8 +5206,9 @@ void DzBridgeAction::writePoseData(DzNode* Node, DzJsonWriter& writer, bool bIsF
 		QString sObjectName = "EMPTY";
 		if (sObjectType == "MESH")
 			sObjectName = node->getObject()->getName();
-		DzVec3 vecPosition = node->getLocalPos();
-		DzMatrix3 matrixScale = node->getLocalScale();
+		DzTime currentTime = dzScene->getTime();
+		DzVec3 vecPosition = node->getLocalPos(currentTime, false);
+		DzMatrix3 matrixScale = node->getLocalScale(currentTime, false);
 
 		writer.startMemberObject(sNodeName);
 		writer.addMember("Name", sNodeName);
@@ -4451,79 +5456,77 @@ bool is_faced_mesh_single(DzNode* pNode)
 	return true;
 }
 
-bool DzBridgeAction::checkForGeograftMorphsToExport(DzNode* Node, bool bZeroMorphForExport)
+bool DzBridgeAction::prepareGeograftMorphsToExport(DzNode* Node, bool bZeroMorphForExport)
 {
 	bool bGeograftMorphsFoundToExport = false;
-	DzNode* pGeograftNode = nullptr;
+	QList<DzNode*> aGeograftNodes;
 	DzNode* pParentNode = Node;
 	// 1. find geograft/genital
 	DzNodeListIterator oNodeChildrenIter = Node->nodeChildrenIterator();
 	while (oNodeChildrenIter.hasNext())
 	{
 		DzNode* pChild = oNodeChildrenIter.next();
-		DzPresentation* presentation = pChild->getPresentation();
-		if (presentation)
+		if (isGeograft(pChild))
 		{
-			const QString presentationType = presentation->getType();
-			if (pChild->getName().toLower().contains("genital") ||
-				presentationType == "Follower/Attachment/Lower-Body/Hip/Front" ||
-				presentationType == "Follower/Attachment/Lower-Body")
-			{
-				pGeograftNode = pChild;
-				break;
-			}
+//			pGeograftNode = pChild;
+			aGeograftNodes.append(pChild);
+//			break;
 		}
 	}
-	if (pGeograftNode == nullptr)
+	if (aGeograftNodes.count() == 0)
 	{
 		return false;
 	}
 	DzNumericProperty* previousProperty = nullptr;
-	for (int index = 0; index < pGeograftNode->getNumProperties(); index++)
+	for (DzNode* pGeograftNode : aGeograftNodes)
 	{
-		DzProperty* property = pGeograftNode->getProperty(index);
-		DzNumericProperty* numericProperty = qobject_cast<DzNumericProperty*>(property);
-		if (numericProperty && !numericProperty->isOverridingControllers())
+		for (int index = 0; index < pGeograftNode->getNumProperties(); index++)
 		{
-			QString propName = property->getName();
-			if (m_mMorphNameToLabel.contains(propName))
+			DzProperty* property = pGeograftNode->getProperty(index);
+			DzNumericProperty* numericProperty = qobject_cast<DzNumericProperty*>(property);
+			if (numericProperty && !numericProperty->isOverridingControllers())
 			{
-				if (bZeroMorphForExport)
+				QString propName = property->getName();
+				if (m_mMorphNameToLabel.contains(propName))
 				{
-					numericProperty->setDoubleValue(0);
+					if (bZeroMorphForExport)
+					{
+						numericProperty->setDoubleValue(0);
+					}
+					bGeograftMorphsFoundToExport = true;
 				}
-				bGeograftMorphsFoundToExport = true;
 			}
 		}
-	}
-	DzObject* Object = pGeograftNode->getObject();
-	if (Object)
-	{
-		for (int index = 0; index < Object->getNumModifiers(); index++)
+		DzObject* Object = pGeograftNode->getObject();
+		if (Object)
 		{
-			DzModifier* modifier = Object->getModifier(index);
-			DzMorph* mod = qobject_cast<DzMorph*>(modifier);
-			if (mod)
+			for (int index = 0; index < Object->getNumModifiers(); index++)
 			{
-				for (int propindex = 0; propindex < modifier->getNumProperties(); propindex++)
+				DzModifier* modifier = Object->getModifier(index);
+				DzMorph* mod = qobject_cast<DzMorph*>(modifier);
+				if (mod)
 				{
-					DzProperty* property = modifier->getProperty(propindex);
-					DzNumericProperty* numericProperty = qobject_cast<DzNumericProperty*>(property);
-					if (numericProperty && !numericProperty->isOverridingControllers())
+					for (int propindex = 0; propindex < modifier->getNumProperties(); propindex++)
 					{
-						QString propName = DzBridgeMorphSelectionDialog::getMorphPropertyName(property);
-						if (m_mMorphNameToLabel.contains(modifier->getName()))
+						DzProperty* property = modifier->getProperty(propindex);
+						DzNumericProperty* numericProperty = qobject_cast<DzNumericProperty*>(property);
+						if (numericProperty && !numericProperty->isOverridingControllers())
 						{
-							if (bZeroMorphForExport)
+							QString propName = DzBridgeMorphSelectionDialog::getMorphPropertyName(property);
+							if (m_mMorphNameToLabel.contains(modifier->getName()))
 							{
-								numericProperty->setDoubleValue(0);
+								if (bZeroMorphForExport)
+								{
+									numericProperty->setDoubleValue(0);
+								}
+								bGeograftMorphsFoundToExport = true;
 							}
-							bGeograftMorphsFoundToExport = true;
 						}
 					}
 				}
 			}
 		}
+
 	}
 
 	return bGeograftMorphsFoundToExport;
@@ -4538,17 +5541,10 @@ bool DzBridgeAction::exportGeograftMorphs(DzNode *Node, QString sDestinationFold
 	while (oNodeChildrenIter.hasNext())
 	{
 		DzNode* pChild = oNodeChildrenIter.next();
-		DzPresentation* presentation = pChild->getPresentation();
-		if (presentation)
+		if (isGeograft(pChild))
 		{
-			const QString presentationType = presentation->getType();
-			if (pChild->getName().toLower().contains("genital") ||
-				presentationType == "Follower/Attachment/Lower-Body/Hip/Front" ||
-				presentationType == "Follower/Attachment/Lower-Body")
-			{
-				pGeograftNode = pChild;
-				break;
-			}
+			pGeograftNode = pChild;
+			break;
 		}
 	}
 	if (pGeograftNode == nullptr)
@@ -4580,7 +5576,7 @@ bool DzBridgeAction::exportGeograftMorphs(DzNode *Node, QString sDestinationFold
 //	pParentNode->setVisible(true);
 
 	// set all morphs to zero
-	// add morphs to TODO list for exporting
+	// add morphs to todo list for exporting
 	QList<QPair<QString, DzNumericProperty*>> oGeograftMorphsToExport;
 	DzNumericProperty* previousProperty = nullptr;
 	for (int index = 0; index < pGeograftNode->getNumProperties(); index++)
@@ -4644,6 +5640,392 @@ bool DzBridgeAction::exportGeograftMorphs(DzNode *Node, QString sDestinationFold
 		bool bIsVisible = UndoPair.second;
 		pNode->setVisible(bIsVisible);
 	}
+
+	return true;
+}
+
+bool DzBridgeAction::isGeograft(const DzNode* pNode)
+{
+	if (pNode->inherits("DzFigure"))
+	{
+		const DzFigure* figure = dynamic_cast<const DzFigure*>(pNode);
+		if (figure->isGraftFollowing())
+		{
+			DzSkeleton* target = figure->getFollowTarget();
+			if (target && target->isVisible() && target->isVisibileInRender())
+			{
+//				dzApp->log("DazBridge: DEBUG: skipping geograft node: " + pNode->getName());
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+void DzBridgeAction::writeAllLodSettings(DzJsonWriter& writer)
+{
+	// Start LOD subsection
+	writer.startMemberObject("LOD Settings");
+
+	// Global LOD settings
+	writer.addMember("Generate LODs", m_bEnableLodGeneration);
+	int lod_method = (int)getLodMethod();
+	writer.addMember("LOD Method", lod_method);
+	writer.addMember("Number of LODs", m_nNumberOfLods);
+	writer.addMember("Use LODGroup", m_bCreateLodGroup);
+
+	// LOD Info array
+	writer.startMemberArray("LOD Info Array", true);
+	foreach(LodInfo * lodinfo, m_aLodInfo)
+	{
+		if (lodinfo)
+		{
+			writer.startObject(true);
+			writer.addMember("Quality Vertex", lodinfo->quality_vertex);
+			writer.addMember("Quality Percent", lodinfo->quality_percent);
+			writer.addMember("Threshold Screen Height", lodinfo->threshold_screen_height);
+			writer.finishObject();
+		}
+	}
+	writer.finishArray();
+
+	writer.finishObject();
+
+}
+
+void DzBridgeAction::setLodMethod(int arg)
+{
+	if (
+		(arg >= getELodMethodMin() ) && 
+		(arg <= getELodMethodMax() )
+		)
+	{
+		m_eLodMethod = (ELodMethod) arg;
+	}
+	else
+	{
+		dzApp->log("ERROR: DzBridgeAction::setLodMethod(): index out of range.");
+	}
+}
+
+QString DzBridgeAction::getLodMethodString()
+{
+	switch (m_eLodMethod)
+	{
+	case ELodMethod::PreGenerated:
+		return QString("Pregenerated");
+	case ELodMethod::Decimator:
+		return QString("Decimator");
+
+	default:
+	case ELodMethod::Undefined:
+		return QString("Undefined");
+	}
+}
+
+void DzBridgeAction::setLodMethod(QString arg)
+{
+	if (
+		(arg.toLower() == "pregenerated") ||
+		(arg.toLower() == "pre-generated")
+		)
+	{
+		m_eLodMethod = ELodMethod::PreGenerated;
+	}
+	else if (arg.toLower().contains("decimator"))
+	{
+		m_eLodMethod = ELodMethod::Decimator;
+	}
+	else if (arg.toLower() == "undefined")
+	{
+		m_eLodMethod = ELodMethod::Undefined;
+	}
+
+	return;
+}
+
+bool DzBridgeAction::combineDiffuseAndAlphaMaps(DzMaterial* Material)
+{
+	DiffuseAndAlphaMapsUndoData undoData;
+
+	if (!Material) return false;
+
+	if (Material)
+	{
+		// DB 2023-Oct-5: Analyze Material, combine diffuse and alpha (cutout)
+		bool bHasCutout = false;
+		DzProperty* cutoutProp = Material->findProperty("Cutout Opacity");
+		DzProperty* opacityStrengthProp = Material->findProperty("Opacity Strength");
+		DzImageProperty* imageProp = qobject_cast<DzImageProperty*>(cutoutProp);
+		DzNumericProperty* numericProp = qobject_cast<DzNumericProperty*>(cutoutProp);
+		if (!cutoutProp && opacityStrengthProp)
+		{
+			imageProp = qobject_cast<DzImageProperty*>(opacityStrengthProp);
+			numericProp = qobject_cast<DzNumericProperty*>(opacityStrengthProp);
+		}
+		QString sAlphaFilename = "";
+		if (imageProp)
+		{
+			sAlphaFilename = imageProp->getValue()->getFilename();
+			if (sAlphaFilename != "")
+			{
+				bHasCutout = true;
+			}
+		}
+		else if (numericProp)
+		{
+			if (numericProp->getMapValue())
+			{
+				sAlphaFilename = numericProp->getMapValue()->getFilename();
+				if (sAlphaFilename != "")
+				{
+					bHasCutout = true;
+				}
+			}
+		}
+		if (bHasCutout == false)
+		{
+			return false;
+		}
+
+		// get diffuse
+		DzProperty* diffuseProp = Material->findProperty("Diffuse Color");
+		DzColorProperty* colorProp = qobject_cast<DzColorProperty*>(diffuseProp);
+		QString sDiffuseFilename = "";
+		if (colorProp && colorProp->getMapValue())
+		{
+			sDiffuseFilename = colorProp->getMapValue()->getFilename();
+		}
+		QString sOriginalDiffuseFilename = sDiffuseFilename;
+
+		if (bHasCutout)
+		{
+			QString stemDiffuse = QFileInfo(sDiffuseFilename).fileName();
+			QString stemAlpha = QFileInfo(sAlphaFilename).fileName();
+
+			// load diffuse
+			QImage diffuseImage;
+			if (sDiffuseFilename == "")
+			{
+				stemDiffuse = "EMPTY";
+				diffuseImage = dzApp->getImageMgr()->loadImage(sAlphaFilename);
+				multiplyImageByColorMultithreaded(diffuseImage, colorProp->getColorValue());
+			}
+			else
+			{
+				diffuseImage = dzApp->getImageMgr()->loadImage(sDiffuseFilename);
+			}
+
+			// load alpha
+			QImage alphaImage = dzApp->getImageMgr()->loadImage(sAlphaFilename);
+
+			// prepare output image
+			QImage outputImage;
+			outputImage = diffuseImage;
+			outputImage.convertToFormat(QImage::Format_ARGB32_Premultiplied);
+
+			// Resize Diffuse and Alpha
+			if (outputImage.height() != alphaImage.height() ||
+				outputImage.width() != alphaImage.width())
+			{
+				// scale diffuse to power of 2
+				if (!isPowerOfTwo(outputImage.height()) || !isPowerOfTwo(outputImage.width()))
+				{
+                    int w = nearestPowerOfTwo(outputImage.width());
+                    int h = nearestPowerOfTwo(outputImage.height());
+					outputImage = outputImage.scaled(w, h, Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
+				}
+
+				// scale alpha to size of diffuse
+				int w = outputImage.width();
+				int h = outputImage.height();
+				alphaImage = alphaImage.scaled(w, h, Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
+
+				if (alphaImage.isGrayscale() == false)
+				{
+					alphaImage.convertToFormat(QImage::Format_Mono);
+				}
+			}
+			// combine diffuse and alpha
+			outputImage.setAlphaChannel(alphaImage);
+			outputImage.convertToFormat(QImage::Format_ARGB32_Premultiplied);
+
+			// save out file
+			QString tempPath = dzApp->getTempPath().replace("\\", "/");
+			QString outfile = tempPath + "/" + stemDiffuse + "+alpha_"+ stemAlpha + ".png";
+			//dzApp->getImageMgr()->saveImage(outfile, outputImage);
+			// DB, 2023-10-27: Save with fastest settings
+			outputImage.save(outfile, 0, 100);
+
+			// create Undo Data
+			DiffuseAndAlphaMapsUndoData undoData;
+			undoData.diffuseProperty = colorProp;
+			undoData.colorMapName = sOriginalDiffuseFilename;
+			undoData.cutoutProperty = numericProp;
+			undoData.cutoutMapName = sAlphaFilename;
+			m_undoList_CombineDiffuseAndAlphaMaps.append(undoData);
+
+			// assign to diffuse property and cutout property
+			colorProp->setMap(outfile);
+			numericProp->setMap(outfile);
+		}
+	}
+
+	return true;
+}
+
+bool DzBridgeAction::undoCombineDiffuseAndAlphaMaps()
+{
+    DzProgress::setCurrentInfo("Daz Bridge: Undoing Combine Diffuse and Alpha Maps...");
+                
+	foreach(DiffuseAndAlphaMapsUndoData undoData, m_undoList_CombineDiffuseAndAlphaMaps)
+	{
+		undoData.diffuseProperty->setMap(undoData.colorMapName);
+		undoData.cutoutProperty->setMap(undoData.cutoutMapName);
+	}
+	m_undoList_CombineDiffuseAndAlphaMaps.clear();
+
+    DzProgress::setCurrentInfo("Daz Bridge: Undo Combine Diffuse and Alpha Maps Complete.");
+
+    return true;
+}
+
+bool DzBridgeAction::multiplyTextureValues(DzMaterial* material)
+{
+	if (!material) return false;
+
+	MultiplyTextureValuesUndoData undoData;
+
+	foreach(QObject *propertyObject, material->getPropertyList())
+	{
+		DzColorProperty* colorProperty = qobject_cast<DzColorProperty*>(propertyObject);
+		DzNumericProperty* numericProperty = qobject_cast<DzNumericProperty*>(propertyObject);
+
+
+		if (colorProperty && colorProperty->getMapValue())
+		{
+			// multiply value
+			QColor colorValue = colorProperty->getColorValue();
+			QString textureFilename = colorProperty->getMapValue()->getFilename();
+
+			if (colorValue != QColor(255, 255, 255) && textureFilename != "")
+			{
+				QImage image = dzApp->getImageMgr()->loadImage(textureFilename);
+				QString tempPath = dzApp->getTempPath().replace("\\", "/");
+				QString stem = QFileInfo(textureFilename).fileName();
+				QString outfile = tempPath + "/" + stem + QString("_%1.png").arg(colorToHexString(colorValue));
+
+				// multiply image
+				dzApp->log(QString("DazBridge: Baking material strength into image: %1").arg(outfile));
+				multiplyImageByColorMultithreaded(image, colorValue);
+
+				// save out file
+//				dzApp->getImageMgr()->saveImage(outfile, image);
+				// DB, 2023-10-27: Save with fastest settings
+				image.save(outfile, 0, 100);
+
+				// create undo record
+				undoData.textureProperty = colorProperty;
+				undoData.textureValue = colorValue.rgba();
+				undoData.textureMapName = textureFilename;
+
+				m_undoList_MultilpyTextureValues.append(undoData);
+
+				// modify property
+				colorProperty->setColorValue(QColor(255,255,255));
+				colorProperty->setMap(outfile);
+			}
+
+		}
+		else if (numericProperty && numericProperty->getMapValue())
+		{
+			// multiply value
+			double numericValue = numericProperty->getDoubleValue();
+			QString textureFilename = numericProperty->getMapValue()->getFilename();
+
+			if (numericValue != 1.0 && textureFilename != "")
+			{
+				QImage image = dzApp->getImageMgr()->loadImage(textureFilename);
+				QString tempPath = dzApp->getTempPath().replace("\\", "/");
+				QString stem = QFileInfo(textureFilename).fileName();
+				QString outfile = tempPath + "/" + stem + QString("_%1.png").arg(numericValue);
+
+				// multiply image
+				dzApp->log(QString("DazBridge: Baking material strength into image: %1").arg(outfile));
+				multiplyImageByStrengthMultithreaded(image, numericValue);
+
+				// save out file
+//				dzApp->getImageMgr()->saveImage(outfile, image);
+				// DB, 2023-10-27: Save with fastest settings
+				image.save(outfile, 0, 100);
+
+				// create undo record
+				undoData.textureProperty = numericProperty;
+				undoData.textureValue = numericValue;
+				undoData.textureMapName = textureFilename;
+
+				m_undoList_MultilpyTextureValues.append(undoData);
+
+			}
+		}
+	}
+
+	return true;
+}
+
+bool DzBridgeAction::undoMultiplyTextureValues()
+{
+
+	foreach(MultiplyTextureValuesUndoData undoData, m_undoList_MultilpyTextureValues)
+	{
+		DzColorProperty* colorProperty = qobject_cast<DzColorProperty*>(undoData.textureProperty);
+		DzNumericProperty* numericProperty = qobject_cast<DzNumericProperty*>(undoData.textureProperty);
+
+		if (colorProperty)
+		{
+			// undo color multiply
+			QColor colorValue( undoData.textureValue.toInt() );
+			colorProperty->setColorValue(colorValue);
+			colorProperty->setMap(undoData.textureMapName);
+		}
+		else if (numericProperty)
+		{
+			// undo numeric multiply
+			double numericValue = undoData.textureValue.toDouble();
+			numericProperty->setDoubleValue(numericValue);
+			numericProperty->setMap(undoData.textureMapName);
+		}
+	}
+	m_undoList_MultilpyTextureValues.clear();
+
+	return true;
+}
+
+bool DzBridgeAction::deleteDir(QString folderPath)
+{
+	QDir qDir(folderPath);
+	QList<QString> aFolderPaths;
+
+	// Delete all files
+	foreach(QFileInfo fileInfo, QDir(folderPath).entryInfoList())
+	{
+		QString filePath = fileInfo.filePath();
+		if (fileInfo.fileName() == "." || fileInfo.fileName() == "..")
+			continue;
+		if (fileInfo.isDir())
+		{
+			aFolderPaths.push_front(filePath);
+			continue;
+		}
+		qDir.remove(filePath);
+	}
+
+	foreach(QString subFolderPath, aFolderPaths)
+	{
+		deleteDir(subFolderPath);
+	}
+
+	qDir.rmdir(folderPath);
 
 	return true;
 }
